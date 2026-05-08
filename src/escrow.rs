@@ -20,7 +20,6 @@ const CLAIM_FEE_SOMPI: u64 = 10_000;
 const NATIVE_SUBNETWORK: &str = "0000000000000000000000000000000000000000";
 
 const OP_CSV: u8 = 0xb1;
-const OP_DROP: u8 = 0x75;
 const OP_CHECKSIG: u8 = 0xac;
 const SIG_HASH_ALL: u8 = 0x01;
 
@@ -141,12 +140,13 @@ impl EscrowWatcher {
             return None;
         }
 
-        // Attempt to claim the first mature, unclaimed, unslashed entry.
+        // +1 margin: BlockAddedNotification arrives before the virtual state DAA score updates,
+        // so claiming exactly at confirm_daa + CHALLENGE_WINDOW_BLOCKS races the sequence lock check.
         let entry = self
             .state
             .entries
             .iter()
-            .find(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS)?
+            .find(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 1)?
             .clone();
 
         match self.build_claim_tx(&entry) {
@@ -181,10 +181,13 @@ impl EscrowWatcher {
                 }
             }
             Some(err_msg) => {
-                // Rejection after CSV expiry = slashed or already spent.
                 warn!("EscrowWatcher: claim rejected for coinbase={}…: {}", &txid[..16.min(txid.len())], err_msg);
                 if let Some(e) = self.state.entries.iter_mut().find(|e| e.coinbase_txid == txid) {
-                    e.slashed = true;
+                    // Sequence-lock rejections are timing races — retry on the next block.
+                    // Any other rejection (double-spend, script failure) is a real slash.
+                    if !err_msg.contains("sequence lock") {
+                        e.slashed = true;
+                    }
                 }
             }
         }
@@ -328,18 +331,19 @@ fn load_state(path: &PathBuf) -> EscrowState {
 
 /// Build the CSV P2PK escrow script identical to the node's `build_escrow_script`.
 ///
-/// `<CHALLENGE_WINDOW_BLOCKS_LE> OP_CSV OP_DROP OP_DATA_32 <pubkey_32> OP_CHECKSIG`
+/// `<CHALLENGE_WINDOW_BLOCKS_LE> OP_CSV OP_DATA_32 <pubkey_32> OP_CHECKSIG`
+///
+/// Keryx's OP_CSV pops its argument, so no OP_DROP is needed after it.
 fn build_escrow_script(pubkey: &[u8; 32]) -> Vec<u8> {
     // 36 000 = 0x8CA0 — trim trailing zero bytes for minimal encoding
     let le = CHALLENGE_WINDOW_BLOCKS.to_le_bytes();
     let trimmed_len = 8 - le.iter().rev().position(|&b| b != 0).unwrap_or(8);
     let seq_bytes = &le[..trimmed_len];
 
-    let mut script = Vec::with_capacity(3 + 1 + 1 + 33 + 1);
+    let mut script = Vec::with_capacity(3 + 1 + 33 + 1);
     script.push(seq_bytes.len() as u8); // OpData2 = 0x02
     script.extend_from_slice(seq_bytes);
     script.push(OP_CSV);
-    script.push(OP_DROP);
     script.push(0x20); // OpData32
     script.extend_from_slice(pubkey);
     script.push(OP_CHECKSIG);
