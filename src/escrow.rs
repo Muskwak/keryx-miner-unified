@@ -6,7 +6,7 @@
 // miner restarts.
 
 use blake2b_simd::Params as Blake2bParams;
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{fs, io};
@@ -215,7 +215,6 @@ impl EscrowWatcher {
                 }
             }
             Some(err_msg) => {
-                warn!("EscrowWatcher: claim rejected for coinbase={}…: {}", &txid[..16.min(txid.len())], err_msg);
                 if let Some(e) = self.state.entries.iter_mut().find(|e| e.coinbase_txid == txid) {
                     // Retriable rejections: sequence-lock timing races and orphan/dag-reorg
                     // situations where the coinbase's block is off the selected chain.
@@ -229,12 +228,18 @@ impl EscrowWatcher {
                             // returning to the selected chain. Slash permanently.
                             e.orphan_slashed = false;
                             e.slashed = true;
-                            warn!(
+                            debug!(
                                 "EscrowWatcher: coinbase={}… slashed after {} orphan retries",
                                 &txid[..16.min(txid.len())],
                                 e.orphan_retries
                             );
                         } else {
+                            debug!(
+                                "EscrowWatcher: claim rejected for coinbase={}… (orphan, retry {}/{})",
+                                &txid[..16.min(txid.len())],
+                                e.orphan_retries,
+                                MAX_ORPHAN_RETRIES
+                            );
                             e.orphan_slashed = true;
                             // Set cooldown: wait ORPHAN_RETRY_COOLDOWN_BLOCKS from the current
                             // DAA score before retrying — the block may return to the selected chain.
@@ -243,7 +248,16 @@ impl EscrowWatcher {
                                 self.orphan_retry_after_daa.map_or(retry_daa, |prev| prev.max(retry_daa)),
                             );
                         }
-                    } else if !is_seq_lock {
+                    } else if is_seq_lock {
+                        debug!(
+                            "EscrowWatcher: claim rejected for coinbase={}… (sequence lock, will retry)",
+                            &txid[..16.min(txid.len())]
+                        );
+                    } else {
+                        warn!(
+                            "EscrowWatcher: claim rejected for coinbase={}…: {}",
+                            &txid[..16.min(txid.len())], err_msg
+                        );
                         e.slashed = true;
                     }
                 }
@@ -393,7 +407,7 @@ fn load_state(path: &PathBuf) -> EscrowState {
             e.orphan_slashed = true;
             e.slashed = false;
         }
-        warn!("EscrowWatcher: migrated {} orphan-slashed entries (retriable retry)", migrated);
+        debug!("EscrowWatcher: migrated {} orphan-slashed entries (retriable retry)", migrated);
     }
 
     state
