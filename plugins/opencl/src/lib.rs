@@ -3,7 +3,7 @@ extern crate keryx_miner;
 
 use clap::{ArgMatches, FromArgMatches};
 use keryx_miner::{Plugin, Worker, WorkerSpec};
-use log::{info, LevelFilter};
+use log::{info, warn, LevelFilter};
 use opencl3::device::{Device, CL_DEVICE_TYPE_ALL};
 use opencl3::platform::{get_platforms, Platform};
 use opencl3::types::cl_device_id;
@@ -77,7 +77,16 @@ impl Plugin for OpenCLPlugin {
             }
             None if !opts.opencl_amd_disable && !amd_platforms.is_empty() => {
                 self._enabled = true;
-                amd_platforms[0]
+                let amd = amd_platforms[0];
+                let plat_name = amd.name().unwrap_or_else(|_| "Unk".into());
+                if !plat_name.contains("ROCm") && !plat_name.contains("AMD Accelerated") {
+                    warn!(
+                        "AMD OpenCL platform detected but does not appear to be the ROCm runtime. \
+                         RDNA 3+ GPUs (RX 7000/9000) may have issues. \
+                         Install rocm-opencl-runtime for best support."
+                    );
+                }
+                amd
             }
             None => &platforms[0],
         };

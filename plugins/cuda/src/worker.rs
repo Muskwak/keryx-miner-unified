@@ -13,6 +13,8 @@ use std::sync::{Arc, Weak};
 
 static BPS: f32 = 1.;
 
+static PTX_100: &str = include_str!("../resources/keryx-cuda-sm100.ptx");
+static PTX_89: &str = include_str!("../resources/keryx-cuda-sm89.ptx");
 static PTX_86: &str = include_str!("../resources/keryx-cuda-sm86.ptx");
 static PTX_75: &str = include_str!("../resources/keryx-cuda-sm75.ptx");
 static PTX_61: &str = include_str!("../resources/keryx-cuda-sm61.ptx");
@@ -160,17 +162,32 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         let minor = device.get_attribute(DeviceAttribute::ComputeCapabilityMinor)?;
         let _module: Arc<Module>;
         info!("Device #{} compute version is {}.{}", device_id, major, minor);
-        if major > 8 || (major == 8 && minor >= 6) {
+        if major >= 10 {
+            // sm_100+ (RTX 50 / Blackwell and future)
+            _module = Arc::new(Module::from_ptx(PTX_100, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+                error!("Error loading PTX. Make sure you have the updated driver for you devices");
+                e
+            })?);
+        } else if major == 9 || (major == 8 && minor >= 9) {
+            // sm_89 (RTX 40 / Ada Lovelace)
+            _module = Arc::new(Module::from_ptx(PTX_89, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+                error!("Error loading PTX. Make sure you have the updated driver for you devices");
+                e
+            })?);
+        } else if major == 8 && minor >= 6 {
+            // sm_86 (RTX 30 / Ampere)
             _module = Arc::new(Module::from_ptx(PTX_86, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
                 e
             })?);
         } else if major > 7 || (major == 7 && minor >= 5) {
+            // sm_75 (RTX 20 / Turing)
             _module = Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
                 e
             })?);
         } else if major > 6 || (major == 6 && minor >= 1) {
+            // sm_61 (GTX 10 / Pascal)
             _module = Arc::new(Module::from_ptx(PTX_61, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
                 e
