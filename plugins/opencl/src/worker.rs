@@ -194,6 +194,8 @@ impl OpenCLGPUWorker {
             false => "",
         };
 
+        // Architectures that do NOT support v_dot4_u32_u8 / v_dot8_u32_u4.
+        // RDNA 3 (gfx1100+) and RDNA 4 (gfx1200+) DO support these and must NOT be added here.
         let experimental_amd_use = !matches!(
             device.name().unwrap_or_else(|_| "Unknown".into()).to_lowercase().as_str(),
             "tahiti" | "ellesmere" | "gfx1010" | "gfx906" | "gfx908"

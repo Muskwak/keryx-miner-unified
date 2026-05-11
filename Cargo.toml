@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner"
-version = "0.2.1-GPU-0.7"
+version = "0.2.3"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/keryx-labs/keryx-miner"
@@ -46,6 +46,8 @@ async-trait = "0.1"
 num = "0.4"
 nix = "0.25"
 hex = "0.4"
+keryx-inference = { path = "../keryx-node/inference" }
+secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
 # Phase-3 OPoI: SLM inference via candle
 candle-core = "0.8"

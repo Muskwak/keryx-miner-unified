@@ -9,6 +9,7 @@ use std::error::Error as StdError;
 #[cfg(feature = "overclock")]
 use {
     log::{error, info},
+    nvml_wrapper::enums::device::GpuLockedClocksSetting,
     nvml_wrapper::Device as NvmlDevice,
     nvml_wrapper::Nvml,
 };
@@ -105,7 +106,10 @@ impl Plugin for CudaPlugin {
                     }
 
                     if let Some(lcc) = lock_core_clock {
-                        match nvml_device.set_gpu_locked_clocks(lcc, lcc) {
+                        match nvml_device.set_gpu_locked_clocks(GpuLockedClocksSetting::Numeric {
+                            min_clock_mhz: lcc,
+                            max_clock_mhz: lcc,
+                        }) {
                             Err(e) => error!("set gpu locked clocks {:?}", e),
                             _ => info!("GPU #{} #{} lock core clock at {} Mhz", i, &nvml_device.name()?, &lcc),
                         };

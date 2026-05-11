@@ -1,39 +1,30 @@
-####################################################################################
-###
-### kaspa-miner
-### https://github.com/tmrlvi/kaspa-miner/releases
-###
-### Hive integration: Merlin
-###
-####################################################################################
-
 #!/usr/bin/env bash
 
-#######################
-# MAIN script body
-#######################
+. /hive/miners/custom/keryx-miner/h-manifest.conf
 
-. /hive/miners/custom/kaspa-miner/h-manifest.conf
-stats_raw=`cat $CUSTOM_LOG_BASENAME.log | grep -w "hashrate" | tail -n 1 `
-#echo $stats_raw
-
-#Calculate miner log freshness
+# Log format: "2026-05-09 12:00:00.000+02:00 [INFO ] Current hashrate is 5.23 Ghash/s"
+stats_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Current hashrate is" | tail -n 1`
 
 maxDelay=120
 time_now=`date +%s`
-datetime_rep=`echo $stats_raw | awk '{print $1}' | awk -F[ '{print $2}'`
-time_rep=`date -d $datetime_rep +%s`
+
+# Parse timestamp from fields $1 (date) and $2 (time), strip timezone offset for date parsing
+datetime_rep=`echo $stats_raw | awk '{split($2,t,/[+-][0-9]{2}:[0-9]{2}$/); print $1, t[1]}'`
+time_rep=`date -d "$datetime_rep" +%s 2>/dev/null || echo 0`
 diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
-        total_hashrate=`echo $stats_raw | awk '{print $7}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
-	if [[ $stats_raw == *"Ghash"* ]]; then
-		total_hashrate=$(($total_hashrate*1000))
-	fi
+        # Value is second-to-last field (before unit), unit is last field
+        total_hashrate=`echo $stats_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+        if [[ $stats_raw == *"Thash"* ]]; then
+                total_hashrate=$(($total_hashrate*1000000000))
+        elif [[ $stats_raw == *"Ghash"* ]]; then
+                total_hashrate=$(($total_hashrate*1000000))
+        elif [[ $stats_raw == *"Mhash"* ]]; then
+                total_hashrate=$(($total_hashrate*1000))
+        fi
 
-        #GPU Status
-        gpu_stats=$(< $GPU_STATS_JSON)
-
+        # GPU status
         readarray -t gpu_stats < <( jq --slurp -r -c '.[] | .busids, .brand, .temp, .fan | join(" ")' $GPU_STATS_JSON 2>/dev/null)
         busids=(${gpu_stats[0]})
         brands=(${gpu_stats[1]})
@@ -45,13 +36,10 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
         busid_arr=()
         fan_arr=()
         temp_arr=()
-        lines=()
 
         if [ $(gpu-detect NVIDIA) -gt 0 ]; then
-                brand_gpu_count=$(gpu-detect NVIDIA)
                 BRAND_MINER="nvidia"
         elif [ $(gpu-detect AMD) -gt 0 ]; then
-                brand_gpu_count=$(gpu-detect AMD)
                 BRAND_MINER="amd"
         fi
 
@@ -60,45 +48,47 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 [[ "${busids[i]}" =~ ^([A-Fa-f0-9]+): ]]
                 busid_arr+=($((16#${BASH_REMATCH[1]})))
                 temp_arr+=(${temps[i]})
-                fan_arr+=(${fans[i]})                
-                gpu_raw=`cat $CUSTOM_LOG_BASENAME.log | grep -w "Device #"$i | tail -n 1 `
+                fan_arr+=(${fans[i]})
+                # Per-device line: "... [INFO ] Device #N: 5.23 Ghash/s"
+                gpu_raw=`cat $CUSTOM_LOG_BASENAME.log | grep "Device #$i:" | tail -n 1`
                 hashrate=`echo $gpu_raw | awk '{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
-                if [[ $gpu_raw == *"Ghash"* ]]; then
+                if [[ $gpu_raw == *"Thash"* ]]; then
+                        hashrate=$(($hashrate*1000000000))
+                elif [[ $gpu_raw == *"Ghash"* ]]; then
+                        hashrate=$(($hashrate*1000000))
+                elif [[ $gpu_raw == *"Mhash"* ]]; then
                         hashrate=$(($hashrate*1000))
                 fi
-                hash_arr+=($hashrate)		
+                hash_arr+=($hashrate)
         done
 
         hash_json=`printf '%s\n' "${hash_arr[@]}" | jq -cs '.'`
-        bus_numbers=`printf '%s\n' "${busid_arr[@]}"  | jq -cs '.'`
-        fan_json=`printf '%s\n' "${fan_arr[@]}"  | jq -cs '.'`
-        temp_json=`printf '%s\n' "${temp_arr[@]}"  | jq -cs '.'`
+        bus_numbers=`printf '%s\n' "${busid_arr[@]}" | jq -cs '.'`
+        fan_json=`printf '%s\n' "${fan_arr[@]}" | jq -cs '.'`
+        temp_json=`printf '%s\n' "${temp_arr[@]}" | jq -cs '.'`
 
         uptime=$(( `date +%s` - `stat -c %Y $CUSTOM_CONFIG_FILENAME` ))
 
-
-        #Compile stats/khs
         stats=$(jq -nc \
-                --argjson hs "$hash_json"\
+                --argjson hs "$hash_json" \
                 --arg ver "$CUSTOM_VERSION" \
                 --arg ths "$total_hashrate" \
                 --argjson bus_numbers "$bus_numbers" \
                 --argjson fan "$fan_json" \
                 --argjson temp "$temp_json" \
                 --arg uptime "$uptime" \
-                '{ hs: $hs, hs_units: "khs", algo : "heavyhash", ver:$ver , $uptime, $bus_numbers, $temp, $fan}')
+                '{ hs: $hs, hs_units: "khs", algo: "heavyhash", ver: $ver, $uptime, $bus_numbers, $temp, $fan }')
         khs=$total_hashrate
 else
-  khs=0
-  stats="null"
+        khs=0
+        stats="null"
 fi
 
-echo Debug info:
-echo Log file : $CUSTOM_LOG_BASENAME.log
-echo Time since last log entry : $diffTime
-echo Raw stats : $stats_raw
-echo KHS : $khs
-echo Output : $stats
+echo "Log file : $CUSTOM_LOG_BASENAME.log"
+echo "Time since last log entry : $diffTime"
+echo "Raw stats : $stats_raw"
+echo "KHS : $khs"
+echo "Output : $stats"
 
 [[ -z $khs ]] && khs=0
 [[ -z $stats ]] && stats="null"

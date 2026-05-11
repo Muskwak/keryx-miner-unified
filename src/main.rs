@@ -24,6 +24,7 @@ use crate::target::Uint256;
 
 mod cli;
 mod client;
+mod escrow;
 mod keryxd_messages;
 mod miner;
 mod pow;
@@ -73,6 +74,9 @@ async fn get_client(
     mining_address: String,
     mine_when_not_synced: bool,
     block_template_ctr: Arc<AtomicU16>,
+    escrow_pubkey: Option<String>,
+    escrow_privkey: Option<String>,
+    escrow_state_file: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -89,6 +93,9 @@ async fn get_client(
             mining_address.clone(),
             mine_when_not_synced,
             Some(block_template_ctr.clone()),
+            escrow_pubkey,
+            escrow_privkey,
+            escrow_state_file,
         )
         .await?)
     } else {
@@ -106,6 +113,9 @@ async fn client_main(
         opt.mining_address.clone(),
         opt.mine_when_not_synced,
         block_template_ctr.clone(),
+        opt.escrow_pubkey.clone(),
+        opt.escrow_privkey.clone(),
+        opt.escrow_state_file.clone(),
     )
     .await?;
 
@@ -140,6 +150,29 @@ async fn main() -> Result<(), Error> {
     info!("                 Keryx-Miner GPU {}", env!("CARGO_PKG_VERSION"));
     info!(" Mining for: {}", opt.mining_address);
     info!("=================================================================================");
+
+    // Resolve OPoI escrow credentials (once, before the reconnect loop).
+    if opt.no_opoi {
+        info!("OPoI disabled (--no-opoi): 20% of block reward will be burned.");
+        opt.escrow_privkey = None;
+        opt.escrow_pubkey = None;
+    } else if opt.escrow_privkey.is_some() {
+        info!("OPoI enabled — using explicit private key (--escrow-privkey).");
+    } else if opt.escrow_pubkey.is_some() {
+        info!("OPoI enabled — using explicit public key (--escrow-pubkey).");
+    } else {
+        match escrow::load_or_generate_key(&opt.escrow_key_file) {
+            Ok(privkey) => {
+                info!("OPoI enabled — escrow key loaded from '{}'.", opt.escrow_key_file);
+                opt.escrow_privkey = Some(privkey);
+            }
+            Err(e) => {
+                error!("Failed to load/generate OPoI escrow key: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+
     // Phase-3 OPoI: load TinyLlama-1.1B before mining starts.
     // Downloads the model (~2.2 GB) on first run. Mining is blocked until ready.
     info!("Loading SLM model (TinyLlama-1.1B) — this may take a few minutes on first run…");
