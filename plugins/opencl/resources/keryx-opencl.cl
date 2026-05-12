@@ -186,6 +186,12 @@ constant const ulong heavyP[25] = { 0x3ad74c52b2248509UL, 0x79629b0e2f9f4216UL, 
  *   WAVE_MIX_KEYS[3] = 0x243f6a8885a308d3  (frac. bits of π)
  * Rotation schedule: [17, 47, 31, 13]
  * ====================================================================== */
+/* Moved before wave_mix_hash so the type is visible to all consumers. */
+typedef union _Hash {
+  ulong4 hash;
+  uchar bytes[32];
+} Hash;
+
 constant STATIC const ulong WAVE_MIX_KEYS[4] = {
     0x9e3779b97f4a7c15UL,
     0x6c62272e07bb0142UL,
@@ -280,10 +286,6 @@ inline uint64_t xoshiro256_next(global ulong4 *s) {
 #ifdef cl_khr_int64_base_atomics
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics: enable
 #endif
-typedef union _Hash {
-  ulong4 hash;
-  uchar bytes[32];
-} Hash;
 
 #define BLOCKDIM 1024
 #define MATRIX_SIZE 64
