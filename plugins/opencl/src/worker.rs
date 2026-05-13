@@ -160,7 +160,7 @@ impl OpenCLGPUWorker {
         workload: f32,
         is_absolute: bool,
         experimental_amd: bool,
-        mut use_binary: bool,
+        use_binary: bool,
         random: &NonceGenEnum,
     ) -> Result<Self, Error> {
         let name =
@@ -213,13 +213,11 @@ impl OpenCLGPUWorker {
                         Program::create_and_build_from_binary(&context, &[binary.contents()], "").unwrap_or_else(|e|{
                         //Program::create_and_build_from_binary(&context, &[include_bytes!("../resources/keryx-opencl-linked.bc")], "").unwrap_or_else(|e|{
                             warn!("{}::Program::create_and_build_from_source failed: {}. Reverting to compiling from source", name, e);
-                            use_binary = false;
                             from_source(&context, &device, options).unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_binary failed: {}", name, e))
                         })
                     }
                     None => {
                         warn!("Binary file not found for {}. Reverting to compiling from source.", device_name);
-                        use_binary = false;
                         from_source(&context, &device, options)
                             .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_binary failed: {}", name, e))
                     }
