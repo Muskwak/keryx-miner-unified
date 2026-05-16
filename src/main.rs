@@ -181,12 +181,10 @@ async fn main() -> Result<(), Error> {
 
         let url_clone = url.clone();
         let api_entries: Vec<ApiEscrowEntry> = tokio::task::spawn_blocking(move || {
-            let body = ureq::get(&url_clone)
+            let response = ureq::get(&url_clone)
                 .call()
-                .map_err(|e| format!("HTTP request failed: {}", e))?
-                .into_string()
-                .map_err(|e| format!("Failed to read response body: {}", e))?;
-            serde_json::from_str::<Vec<ApiEscrowEntry>>(&body)
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            serde_json::from_reader::<_, Vec<ApiEscrowEntry>>(response.into_reader())
                 .map_err(|e| format!("JSON parse error: {}", e))
         })
         .await

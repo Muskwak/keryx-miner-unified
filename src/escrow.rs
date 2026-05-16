@@ -60,6 +60,11 @@ pub struct EscrowState {
 
 /// DAA-score cooldown after an orphan rejection before retrying the claim.
 const ORPHAN_RETRY_COOLDOWN_BLOCKS: u64 = 100;
+/// DAA-score cooldown after a sequence-lock rejection before retrying.
+/// The OP_CSV check uses the selected-chain blue score, which can lag the DAA
+/// score by a few blocks in the DAG — a short cooldown avoids hammering the
+/// node every block for a TX that will be rejected again immediately.
+const SEQ_LOCK_RETRY_COOLDOWN_BLOCKS: u64 = 20;
 /// After this many consecutive orphan rejections, give up and slash permanently.
 const MAX_ORPHAN_RETRIES: u8 = 10;
 
@@ -211,9 +216,10 @@ impl EscrowWatcher {
             return None;
         }
 
-        // +1 margin: BlockAddedNotification arrives before the virtual state DAA score updates,
-        // so claiming exactly at confirm_daa + CHALLENGE_WINDOW_BLOCKS races the sequence lock check.
-        // Per-entry orphan cooldowns are checked individually so they don't block other claims.
+        // +10 margin: OP_CSV validation uses the selected-chain blue score, which can lag the
+        // virtual-state DAA score by several blocks in the BlockDAG.  A single +1 margin is
+        // often not enough, causing seq-lock rejections that get retried every block.
+        // Per-entry orphan/seq-lock cooldowns are checked individually so they don't block other claims.
         let entry = self
             .state
             .entries
@@ -221,7 +227,7 @@ impl EscrowWatcher {
             .find(|e| {
                 !e.claimed
                     && !e.slashed
-                    && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 1
+                    && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10
                     && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
             })?
             .clone();
@@ -296,10 +302,15 @@ impl EscrowWatcher {
                                 Some(self.last_daa_score + ORPHAN_RETRY_COOLDOWN_BLOCKS);
                         }
                     } else if is_seq_lock {
+                        // Apply a per-entry cooldown instead of retrying every block —
+                        // the OP_CSV blue-score check may lag DAA score by a few blocks.
+                        e.orphan_retry_after_daa =
+                            Some(self.last_daa_score + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS);
                         debug!(
-                            "EscrowWatcher: claim rejected for coinbase={}…[{}] (sequence lock, will retry)",
+                            "EscrowWatcher: claim rejected for coinbase={}…[{}] (sequence lock, retry after daa {})",
                             &txid[..16.min(txid.len())],
                             out_idx,
+                            self.last_daa_score + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS,
                         );
                     } else {
                         warn!(
