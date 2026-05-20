@@ -12,8 +12,13 @@ use std::io::{Read, Write};
 use std::sync::OnceLock;
 use tokenizers::Tokenizer;
 
-const MODEL_ID: &str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
-const HF_BASE: &str = "https://huggingface.co";
+// IPFS CIDs for the TinyLlama-1.1B-Chat model files (pinned on keryx-node-01).
+// Gateways are tried in order: local daemon first, then public fallbacks.
+const CID_TOKENIZER: &str = "QmSKrRu8HRt9v2dUeVdABKDkuREa5xFhPLZdevvvBfDYmp";
+const CID_CONFIG: &str = "QmbLTR3GLjBUKw8Lj14isiwG3XZJaL61ES852vkNqNPhyd";
+const CID_WEIGHTS: &str = "QmdqcmS8aMngiZWYYdeZEaW22N6XRTd9zK5ZCJG1MPmrQ3";
+
+const IPFS_GATEWAY: &str = "https://keryx-labs.com";
 const SYSTEM_PROMPT: &str =
     "You are a concise AI assistant embedded in the Keryx blockchain network. \
      Reply in 1-3 sentences maximum.";
@@ -62,7 +67,12 @@ impl SlmEngine {
         }
     }
 
-    /// Download a single file from HuggingFace with a stderr progress bar.
+    fn download_from_ipfs(cid: &str, dest: &std::path::Path) -> Result<()> {
+        let url = format!("{}/ipfs/{}", IPFS_GATEWAY, cid);
+        Self::download_file(&url, dest)
+    }
+
+    /// Download a single file from `url` with a stderr progress bar.
     fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         eprintln!("[keryx-miner] Downloading {} ...", url);
         let response = ureq::get(url)
@@ -117,21 +127,17 @@ impl SlmEngine {
         let cfg_path = model_dir.join("config.json");
         let wts_path = model_dir.join("model.safetensors");
 
-        let base = format!("{}/{}/resolve/main", HF_BASE, MODEL_ID);
-
-        eprintln!(
-            "\n[keryx-miner] TinyLlama-1.1B model not found in local cache."
-        );
-        eprintln!("[keryx-miner] Downloading model files (~2.2 GB). This happens once.\n");
+        eprintln!("\n[keryx-miner] TinyLlama-1.1B model not found in local cache.");
+        eprintln!("[keryx-miner] Downloading model files via IPFS (~2.2 GB). This happens once.\n");
 
         if !tok_path.exists() {
-            Self::download_file(&format!("{}/tokenizer.json", base), &tok_path)?;
+            Self::download_from_ipfs(CID_TOKENIZER, &tok_path)?;
         }
         if !cfg_path.exists() {
-            Self::download_file(&format!("{}/config.json", base), &cfg_path)?;
+            Self::download_from_ipfs(CID_CONFIG, &cfg_path)?;
         }
         if !wts_path.exists() {
-            Self::download_file(&format!("{}/model.safetensors", base), &wts_path)?;
+            Self::download_from_ipfs(CID_WEIGHTS, &wts_path)?;
         }
 
         eprintln!("[keryx-miner] Model download complete.\n");
