@@ -40,9 +40,9 @@ pub struct KeryxdHandler {
     block_handle: BlockHandle,
 
     /// Queue of AiRequests waiting for inference.
-    /// Each entry: (stable_id_hex16, raw_payload_bytes, prompt, max_tokens).
+    /// Each entry: (stable_id_hex16, raw_payload_bytes, model_id, prompt, max_tokens).
     /// Fed by both BlockAdded scans and block template scans.
-    ai_request_queue: VecDeque<(String, Vec<u8>, String, usize)>,
+    ai_request_queue: VecDeque<(String, Vec<u8>, [u8; 32], String, usize)>,
 
     /// Stable IDs already queued or in-flight — used for deduplication.
     ai_seen_prefixes: std::collections::HashSet<String>,
@@ -210,32 +210,40 @@ impl KeryxdHandler {
             txs.iter().map(|t| t.subnetwork_id.as_str()).collect::<Vec<_>>()
         );
         for tx in txs {
-            let extracted: Option<(Vec<u8>, String, usize)> =
+            let extracted: Option<(Vec<u8>, [u8; 32], String, usize)> =
                 if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX {
                     // Binary AiRequestPayload (dedicated AI subnetwork).
                     hex::decode(&tx.payload).ok().and_then(|raw| {
                         keryx_inference::AiRequestPayload::deserialize(&raw).map(|req| {
+                            let model_id = req.model_id;
                             let prompt = String::from_utf8_lossy(&req.prompt).into_owned();
-                            (raw, prompt, req.max_tokens as usize)
+                            let max_tokens = req.max_tokens as usize;
+                            (raw, model_id, prompt, max_tokens)
                         })
                     })
                 } else if !tx.inputs.is_empty() {
-                    // KRX:AI:1: JSON format used by the web wallet (native subnetwork).
+                    // KRX:AI:1: JSON format used by the web wallet — defaults to TinyLlama.
                     hex::decode(&tx.payload).ok().and_then(|raw| {
-                        Self::parse_krx_ai_payload(&raw)
-                            .map(|(prompt, max_tokens)| (raw, prompt, max_tokens))
+                        Self::parse_krx_ai_payload(&raw).map(|(prompt, max_tokens)| {
+                            (raw, keryx_miner::models::TINYLLAMA.model_id, prompt, max_tokens)
+                        })
                     })
                 } else {
                     None // coinbase — skip
                 };
 
-            if let Some((raw, prompt, max_tokens)) = extracted {
+            if let Some((raw, model_id, prompt, max_tokens)) = extracted {
+                let loaded = keryx_miner::slm::loaded_model_ids();
+                if !loaded.contains(&model_id) {
+                    log::debug!("OPoI: skipping AiRequest for unknown/unloaded model_id");
+                    continue;
+                }
                 let hash = blake2b_simd::blake2b(&raw);
                 let stable_id = hex::encode(&hash.as_bytes()[..8]);
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("OPoI: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
-                    self.ai_request_queue.push_back((stable_id, raw, prompt, max_tokens));
+                    self.ai_request_queue.push_back((stable_id, raw, model_id, prompt, max_tokens));
                 }
             }
         }
@@ -259,11 +267,12 @@ impl KeryxdHandler {
         if self.inference_rx.is_some() {
             return;
         }
-        if let Some((_stable_id, raw, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
+        if let Some((_stable_id, raw, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
             info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
             let (tx_done, rx_done) = oneshot::channel::<String>();
             tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::run_inference(&prompt, max_tokens);
+                let result = keryx_miner::slm::run_inference(&model_id, &prompt, max_tokens)
+                    .unwrap_or_else(|| "[no engine for model]".to_string());
                 let _ = tx_done.send(result);
             });
             self.inference_rx = Some((raw, rx_done));
