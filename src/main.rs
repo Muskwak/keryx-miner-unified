@@ -233,18 +233,24 @@ async fn main() -> Result<(), Error> {
         }
     };
 
-    // Phase-3 OPoI: load TinyLlama-1.1B before mining starts.
-    // Downloads the model (~2.2 GB) on first run. Mining is blocked until ready.
-    info!("Loading SLM model (TinyLlama-1.1B) — this may take a few minutes on first run…");
-    match tokio::task::spawn_blocking(keryx_miner::slm::load_blocking).await {
-        Ok(Ok(())) => info!("SLM model ready — OPoI Phase-3 active."),
+    // Phase-3 OPoI: load inference models before mining starts.
+    // By default both TinyLlama and DeepSeek-R1-8B are loaded.
+    // Pass --light to run TinyLlama only (limited disk / bandwidth).
+    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.light {
+        info!("--light mode: loading TinyLlama only.");
+        &[&keryx_miner::models::TINYLLAMA]
+    } else {
+        &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
+    };
+    info!("Loading {} inference model(s) — this may take a few minutes on first run…", specs.len());
+    match tokio::task::spawn_blocking(move || keryx_miner::slm::load_all_blocking(specs)).await {
+        Ok(Ok(())) => info!("All models ready — OPoI Phase-3 active."),
         Ok(Err(e)) => {
-            error!("Failed to load SLM model: {}", e);
-            error!("Mining requires TinyLlama-1.1B. Check your internet connection and retry.");
+            error!("Failed to load inference models: {}", e);
             return Err(e.into());
         }
         Err(e) => {
-            error!("SLM model load thread panicked: {}", e);
+            error!("Model load thread panicked: {}", e);
             return Err(format!("model load panicked: {}", e).into());
         }
     }

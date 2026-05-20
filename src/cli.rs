@@ -57,6 +57,12 @@ pub struct Opt {
     )]
     pub recover_escrow_api: String,
 
+    #[clap(
+        long = "light",
+        help = "Run TinyLlama only — skips DeepSeek-R1-8B download (for miners with limited disk or bandwidth)"
+    )]
+    pub light: bool,
+
     #[clap(skip)]
     pub devfund_address: String,
 }
