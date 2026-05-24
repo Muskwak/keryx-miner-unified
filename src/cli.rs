@@ -63,6 +63,13 @@ pub struct Opt {
     )]
     pub light: bool,
 
+    #[clap(
+        long = "ipfs-url",
+        help = "IPFS Kubo API URL for uploading inference results",
+        default_value = "http://127.0.0.1:5001"
+    )]
+    pub ipfs_url: String,
+
     #[clap(skip)]
     pub devfund_address: String,
 }

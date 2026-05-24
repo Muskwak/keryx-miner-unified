@@ -25,6 +25,7 @@ use crate::target::Uint256;
 mod cli;
 mod client;
 mod escrow;
+mod ipfs;
 mod keryxd_messages;
 mod miner;
 mod pow;
@@ -76,6 +77,7 @@ async fn get_client(
     block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
+    ipfs_url: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -94,6 +96,7 @@ async fn get_client(
             Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
+            ipfs_url,
         )
         .await?)
     } else {
@@ -107,6 +110,9 @@ async fn client_main(
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
 ) -> Result<(), Error> {
+    let ipfs_url = opt.ipfs_url.clone();
+    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
+
     let mut client = get_client(
         opt.keryxd_address.clone(),
         opt.mining_address.clone().unwrap_or_default(),
@@ -114,6 +120,7 @@ async fn client_main(
         block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
+        opt.ipfs_url.clone(),
     )
     .await?;
 

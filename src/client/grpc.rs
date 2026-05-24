@@ -10,7 +10,6 @@ use crate::proto::{
 use crate::{miner::MinerManager, Error};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use base64::Engine as _;
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
@@ -48,13 +47,13 @@ pub struct KeryxdHandler {
     ai_seen_prefixes: std::collections::HashSet<String>,
 
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
-    /// The raw bytes are kept to compute the payload_prefix for the coinbase tag.
     inference_rx: Option<(Vec<u8>, oneshot::Receiver<String>)>,
 
-    /// Completed inference result waiting to be embedded in the next coinbase.
-    /// Format: (payload_prefix_16hex, base64url_result).
-    /// Cleared after a successful block submit.
-    pending_ai_response: Option<(String, String)>,
+    /// Last DAA score seen in a block template — used to compute challenge_window_end.
+    last_known_daa: u64,
+
+    /// IPFS Kubo API URL for uploading inference results.
+    ipfs_url: String,
 
     /// 64-char hex Schnorr pubkey embedded in coinbase extra_data as `/escrow:<pubkey>`.
     /// The node routes 20% of the block reward to the corresponding CSV-locked escrow output.
@@ -99,6 +98,7 @@ impl KeryxdHandler {
         block_template_ctr: Option<Arc<AtomicU16>>,
         escrow_privkey: Option<String>,
         escrow_state_file: String,
+        ipfs_url: String,
     ) -> Result<Box<Self>, Error>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
@@ -143,7 +143,8 @@ impl KeryxdHandler {
             ai_request_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
             inference_rx: None,
-            pending_ai_response: None,
+            last_known_daa: 0,
+            ipfs_url,
             escrow_pubkey,
             escrow_watcher,
         }))
@@ -199,11 +200,7 @@ impl KeryxdHandler {
                 format!("/ai:cap:{}", hex_ids.join(","))
             }
         };
-        // Append response tag when a completed inference is waiting to be published.
-        let ai_response_tag = self.pending_ai_response.as_ref()
-            .map(|(prefix, b64)| format!("/ai:r:{}:{}", prefix, b64))
-            .unwrap_or_default();
-        let extra_data = format!("{}{}/{}/ai:v1:{}{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part, ai_response_tag);
+        let extra_data = format!("{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part);
         self.client_send(GetBlockTemplateRequestMessage { pay_address, extra_data }).await
     }
 
@@ -291,27 +288,49 @@ impl KeryxdHandler {
         }
     }
 
-    /// Polls the in-flight inference task.
-    /// When complete, stores `(payload_prefix, base64_result)` in
-    /// `pending_ai_response` so the next coinbase embeds the `/ai:r:` tag.
-    /// Returns `true` if inference just finished.
-    fn poll_inference(&mut self) -> bool {
-        let Some((ref raw, ref mut rx)) = self.inference_rx.as_mut() else {
+    /// Polls the in-flight inference task. When complete, uploads the result to
+    /// IPFS and submits a zero-input/zero-output AiResponse transaction.
+    /// Returns `true` if inference just finished (regardless of tx success).
+    async fn poll_inference(&mut self) -> bool {
+        let Some((raw, mut rx)) = self.inference_rx.take() else {
             return false;
         };
         let Ok(result) = rx.try_recv() else {
+            self.inference_rx = Some((raw, rx));
             return false;
         };
 
-        // payload_prefix = blake2b(raw)[0..8] as 16 hex chars.
-        // Matches ai_requests.payload_prefix stored by the indexer.
-        let full_hash = blake2b_simd::blake2b(raw);
-        let prefix = hex::encode(&full_hash.as_bytes()[..8]);
-        let result_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(result.as_bytes());
+        let full_hash = blake2b_simd::blake2b(&raw);
+        let request_hash: [u8; 32] = full_hash.as_bytes()[..32].try_into().unwrap();
+        info!("OPoI: inference complete, request_hash={}", hex::encode(&request_hash[..8]));
 
-        self.inference_rx = None;
-        info!("OPoI: inference complete, prefix={}", prefix);
-        self.pending_ai_response = Some((prefix, result_b64));
+        let ipfs_url = self.ipfs_url.clone();
+        let result_clone = result.clone();
+        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload(&result_clone, &ipfs_url)).await {
+            Ok(Ok(cid)) => cid,
+            Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
+            Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
+        };
+
+        let challenge_window_end = self.last_known_daa + 1000;
+        let response_length = result.split_whitespace().count() as u32;
+        let resp = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+        info!("OPoI: uploading response CID={}, challenge_window_end={}", resp.cid_v0(), challenge_window_end);
+
+        let rpc_tx = crate::proto::RpcTransaction {
+            version: 0,
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: 0,
+            subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX.to_string(),
+            gas: 0,
+            payload: hex::encode(resp.serialize()),
+            mass: 0,
+            verbose_data: None,
+        };
+        if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
+            warn!("OPoI: failed to send AiResponse tx: {}", e);
+        }
         true
     }
 
@@ -349,9 +368,17 @@ impl KeryxdHandler {
             }
             Payload::NewBlockTemplateNotification(_) => self.client_get_block_template().await?,
             Payload::GetBlockTemplateResponse(template) => {
-                // Poll any in-flight inference; if done, request a fresh template
-                // so the /ai:r: response tag is embedded in the next coinbase we mine.
-                if self.poll_inference() {
+                // Track DAA score for challenge_window_end computation.
+                if let Some(daa) = template.block.as_ref()
+                    .and_then(|b| b.header.as_ref())
+                    .map(|h| h.daa_score)
+                {
+                    if daa > self.last_known_daa {
+                        self.last_known_daa = daa;
+                    }
+                }
+                // Poll in-flight inference; if done, submit AiResponse tx then get fresh template.
+                if self.poll_inference().await {
                     self.client_get_block_template().await?;
                     return Ok(());
                 }
@@ -386,11 +413,7 @@ impl KeryxdHandler {
                 }
             }
             Payload::SubmitBlockResponse(res) => match res.error {
-                None => {
-                    info!("block submitted successfully!");
-                    // Response was embedded in this block — clear pending state.
-                    self.pending_ai_response = None;
-                }
+                None => info!("block submitted successfully!"),
                 Some(e) => warn!("Failed submitting block: {:?}", e),
             },
             Payload::SubmitTransactionResponse(res) => {

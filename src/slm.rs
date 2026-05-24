@@ -16,17 +16,16 @@ use tokenizers::Tokenizer;
 use crate::models::{ModelFormat, ModelSpec};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
-const SYSTEM_PROMPT: &str =
+const SYSTEM_PROMPT_TINYLLAMA: &str =
+    "You are a Keryx Network AI — a decentralized assistant running on GPU miners. \
+     No internet access. Be concise.";
+
+const SYSTEM_PROMPT_DEEPSEEK: &str =
     "You are an AI assistant running inside the Keryx decentralized network. \
-     Keryx is a BlockDAG protocol (10 blocks/second) where GPU miners execute AI inference \
-     as part of their proof-of-work. Results are published on-chain and economically secured \
-     via OPoI (Optimistic Proof of Inference): miners stake 20% of their block reward as \
-     collateral — dishonest responses are slashable by anyone within a challenge window. \
-     The native currency is KRX. There is no central operator, no content policy, and no \
-     internet access during inference — answer from training knowledge only. \
-     You are neutral, permissionless, and censorship-resistant by design. \
-     Always identify yourself as a Keryx network AI, not by your original model name. \
-     Be concise: 2-4 sentences maximum.";
+     Keryx is a BlockDAG protocol where GPU miners execute AI inference as proof-of-work. \
+     Results are published on-chain and secured via OPoI (Optimistic Proof of Inference). \
+     You have no internet access — answer from training knowledge only. \
+     Always identify yourself as a Keryx Network AI. Be concise: 3-5 sentences max.";
 
 // ── Static engine pool ───────────────────────────────────────────────────────
 
@@ -196,12 +195,12 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n",
-            SYSTEM_PROMPT, prompt
+            SYSTEM_PROMPT_DEEPSEEK, prompt
         ),
-        // Zephyr/TinyLlama chat template
+        // Zephyr/TinyLlama chat template — short prompt to avoid regurgitation
         _ => format!(
             "<|system|>\n{}</s>\n<|user|>\n{}</s>\n<|assistant|>\n",
-            SYSTEM_PROMPT, prompt
+            SYSTEM_PROMPT_TINYLLAMA, prompt
         ),
     }
 }
@@ -213,7 +212,8 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
     let mut all_tokens: Vec<u32> = enc.get_ids().to_vec();
     let mut generated: Vec<u32> = Vec::new();
     let mut lp = LogitsProcessor::new(42, Some(0.7), Some(0.9));
-    let max_steps = max_new_tokens.min(512);
+    let model_max = match engine.name { "deepseek-r1-8b" => 1024, _ => 2048 };
+    let max_steps = max_new_tokens.min(model_max);
 
     match &mut engine.inner {
         ModelInner::Full { model, config, cache_dtype } => {
