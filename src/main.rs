@@ -70,6 +70,78 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
     }
 }
 
+/// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
+///
+/// VRAM requirements (GGUF weights only, not counting CUDA workspace):
+///   TinyLlama-1.1B  →  ~1.5 GB
+///   DeepSeek-R1-8B  →  ~5 GB
+///   DeepSeek-R1-32B → ~19 GB   (requires ≥24 GB card)
+///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
+///
+/// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
+fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=power.limit,power.max_limit,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+
+    let (current_w, max_w, vram_mb) = match output {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let mut parts = s.trim().split(',');
+            let cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+            let max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+            let vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+            (cur as u32, max as u32, vram)
+        }
+        _ => return, // nvidia-smi unavailable — skip silently (non-NVIDIA or no driver)
+    };
+
+    // VRAM check for 70B: 28 GB weights + ~2.5 GB KV cache → requires ≥32 GB card (RTX 5090+).
+    // On 24 GB cards (RTX 3090 / 4090), loading will OOM and crash the miner.
+    if needs_very_high && vram_mb < 30_000 {
+        log::error!(
+            "✗  LLaMA-3.3-70B requires ≥32 GB VRAM (RTX 5090 or equivalent) — \
+             this GPU has only {} MB ({} GB).",
+            vram_mb,
+            vram_mb / 1024
+        );
+        log::error!(
+            "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
+        );
+        // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
+    }
+
+    // Power limit check — low PL causes CUDA FIFO instability (Xid 32) under GEMM peaks.
+    let (min_pl, model_label) = if needs_very_high {
+        (360u32, "LLaMA-3.3-70B (--very-high)")
+    } else if needs_high {
+        (340u32, "DeepSeek-R1-32B (--high)")
+    } else {
+        (250u32, "DeepSeek-R1-8B (default)")
+    };
+
+    if current_w < min_pl {
+        log::warn!(
+            "⚠️  GPU power limit is {}W — minimum recommended for {} is {}W.",
+            current_w, model_label, min_pl
+        );
+        log::warn!("   Low PL causes CUDA FIFO instability (Xid 32) during large matrix operations.");
+        log::warn!(
+            "   Run: sudo nvidia-smi -pl {}  (card max: {}W)",
+            min_pl, max_w
+        );
+        log::warn!("   To persist across reboots: enable nvidia-power-limit.service");
+    } else {
+        log::info!(
+            "GPU: {}W PL ✓, {} MB VRAM — ready for {}",
+            current_w, vram_mb, model_label
+        );
+    }
+}
+
 async fn get_client(
     keryxd_address: String,
     mining_address: String,
@@ -246,6 +318,11 @@ async fn main() -> Result<(), Error> {
     //   --light      → TinyLlama only
     //   --high       → TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B
     //   --very-high  → all 4 models
+
+    // Warn if GPU power limit is below safe threshold for the selected model tier.
+    // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
+    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
+
     let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
         info!("--very-high mode: loading all 4 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + LLaMA-70B).");
         &[
