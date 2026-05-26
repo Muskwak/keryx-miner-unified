@@ -151,7 +151,8 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     // 3. Download kubo for the current platform.
     let version = fetch_latest_kubo_version();
     let (os, arch) = detect_platform()?;
-    let archive_name = format!("kubo_v{}_{}-{}.tar.gz", version, os, arch);
+    let archive_ext = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
+    let archive_name = format!("kubo_v{}_{}-{}.{}", version, os, arch, archive_ext);
     let url = format!("https://dist.ipfs.tech/kubo/v{}/{}", version, archive_name);
     let archive_path = exe_dir.join(&archive_name);
 
@@ -161,7 +162,7 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     extract_ipfs_binary(&archive_path, &exe_dir)?;
     std::fs::remove_file(&archive_path).ok();
 
-    let bin = exe_dir.join("ipfs");
+    let bin = exe_dir.join(if cfg!(target_os = "windows") { "ipfs.exe" } else { "ipfs" });
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -229,14 +230,33 @@ fn download_file(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
 }
 
 fn extract_ipfs_binary(archive: &std::path::Path, dest_dir: &std::path::Path) -> anyhow::Result<()> {
+    if archive.extension().and_then(|e| e.to_str()) == Some("zip") {
+        let file = std::fs::File::open(archive)?;
+        let mut zip = zip::ZipArchive::new(file)?;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i)?;
+            let name = entry.name().to_string();
+            let file_name = std::path::Path::new(&name)
+                .file_name()
+                .unwrap_or_default()
+                .to_os_string();
+            if file_name == "ipfs.exe" {
+                let mut out = std::fs::File::create(dest_dir.join(&file_name))?;
+                std::io::copy(&mut entry, &mut out)?;
+                return Ok(());
+            }
+        }
+        return Err(anyhow::anyhow!("ipfs.exe not found in kubo zip archive"));
+    }
+
     let file = std::fs::File::open(archive)?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut tar = tar::Archive::new(gz);
     for entry in tar.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        let file_name = path.file_name().unwrap_or_default();
-        if file_name == "ipfs" || file_name == "ipfs.exe" {
+        let file_name = path.file_name().unwrap_or_default().to_os_string();
+        if file_name == "ipfs" {
             entry.unpack(dest_dir.join(file_name))?;
             return Ok(());
         }

@@ -60,6 +60,7 @@ anyhow = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 flate2 = "1.0"
 tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 default = ["parking_lot"]
