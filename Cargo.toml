@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/keryx-labs/keryx-miner"
@@ -50,15 +50,13 @@ keryx-inference = { path = "inference" }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
 # Phase-3 OPoI: SLM inference via candle
-candle-core = { version = "0.8", features = ["cuda"] }
-candle-transformers = { version = "0.8", features = ["cuda"] }
-candle-nn = { version = "0.8", features = ["cuda"] }
+candle-core = "0.8"
+candle-transformers = "0.8"
+candle-nn = "0.8"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 ureq = { version = "2", features = ["tls"] }
 base64 = "0.22"
 anyhow = "1"
-flate2 = "1.0"
-tar = "0.4"
 time = { version = "0.3", features = ["formatting", "macros"] }
 
 [features]
