@@ -51,7 +51,13 @@ pub struct KeryxdHandler {
     ai_request_txids: std::collections::HashMap<String, (String, u64)>,
 
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
-    inference_rx: Option<(Vec<u8>, oneshot::Receiver<String>)>,
+    /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
+    inference_rx: Option<(Vec<u8>, oneshot::Receiver<Option<String>>)>,
+
+    /// In-flight inference for a node-issued challenge.
+    /// Tuple: (challenge_string, result_receiver) where challenge_string = "model_id_hex:nonce_hex".
+    /// When the result arrives, it is sent back via inference_result in the next GetBlockTemplateRequest.
+    challenge_inference_rx: Option<(String, oneshot::Receiver<Option<String>>)>,
 
     /// Last DAA score seen in a block template — used to compute challenge_window_end.
     last_known_daa: u64,
@@ -98,9 +104,14 @@ impl Client for KeryxdHandler {
                 },
                 Some(None) => break, // stream closed by node
                 None => {
-                    // Timer tick: if an inference just finished (or its task died),
-                    // request a fresh template to resume mining immediately.
+                    // Timer tick: if a regular inference just finished, get a fresh template.
                     if self.inference_rx.is_some() && self.poll_inference().await {
+                        self.client_get_block_template().await?;
+                    // If a challenge is in flight, keep pinging the node so the result is
+                    // delivered as soon as the inference task completes. This is critical on
+                    // sole-producer nodes where mining suspension stops NewBlockTemplate
+                    // notifications and the response would otherwise never be sent.
+                    } else if self.challenge_inference_rx.is_some() {
                         self.client_get_block_template().await?;
                     }
                 }
@@ -168,6 +179,7 @@ impl KeryxdHandler {
             ai_seen_prefixes: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
             inference_rx: None,
+            challenge_inference_rx: None,
             last_known_daa: 0,
             ipfs_url,
             escrow_pubkey,
@@ -226,7 +238,30 @@ impl KeryxdHandler {
             }
         };
         let extra_data = format!("{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part);
-        self.client_send(GetBlockTemplateRequestMessage { pay_address, extra_data }).await
+        // Harvest a pending challenge response if the inference task just finished.
+        let inference_result = match self.challenge_inference_rx.take() {
+            Some((challenge_str, mut rx)) => match rx.try_recv() {
+                Ok(Some(text)) => {
+                    let model_id_hex = challenge_str.split(':').next().unwrap_or("");
+                    info!("OPoI: sending challenge response model={:.8}", model_id_hex);
+                    format!("{}:{}", model_id_hex, text)
+                }
+                Ok(None) => {
+                    warn!("OPoI: challenge inference failed — sending empty result, node will re-challenge");
+                    String::new()
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    self.challenge_inference_rx = Some((challenge_str, rx));
+                    String::new()
+                }
+                Err(_) => {
+                    warn!("OPoI: challenge inference task dropped — sending empty result");
+                    String::new()
+                }
+            },
+            None => String::new(),
+        };
+        self.client_send(GetBlockTemplateRequestMessage { pay_address, extra_data, inference_result }).await
     }
 
     /// Scans a slice of transactions for AiRequest payloads and pushes new
@@ -236,6 +271,13 @@ impl KeryxdHandler {
     ///   - Subnetwork 0x03 + binary `AiRequestPayload` (future on-chain format)
     ///   - Any non-coinbase TX + `KRX:AI:1:` JSON prefix (web wallet format)
     fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction]) {
+        // Hard gate: if no models are ready, refuse to accept any AiRequest.
+        // Prevents miners with missing/truncated model files from ever queuing inference work.
+        let ready_ids = keryx_miner::slm::loaded_model_ids();
+        if ready_ids.is_empty() {
+            log::warn!("OPoI: no models ready — skipping AiRequest scan (run miner with valid model files)");
+            return;
+        }
         log::debug!(
             "scan_ai: {} txs, subnetwork_ids: {:?}",
             txs.len(),
@@ -268,9 +310,8 @@ impl KeryxdHandler {
                 };
 
             if let Some((raw, model_id, prompt, max_tokens, inference_reward)) = extracted {
-                let loaded = keryx_miner::slm::loaded_model_ids();
-                if !loaded.contains(&model_id) {
-                    log::debug!("OPoI: skipping AiRequest for unknown/unloaded model_id");
+                if !ready_ids.contains(&model_id) {
+                    log::debug!("OPoI: skipping AiRequest — model not supported or files not ready");
                     continue;
                 }
                 let hash = blake2b_simd::blake2b(&raw);
@@ -370,12 +411,19 @@ impl KeryxdHandler {
         if self.inference_rx.is_some() {
             return;
         }
-        if let Some((_stable_id, raw, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
+        if let Some((stable_id, raw, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
+            // Second guard: re-check readiness at execution time (files could have been deleted).
+            if !keryx_miner::slm::is_model_ready(&model_id) {
+                log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
+                return;
+            }
             info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
-            let (tx_done, rx_done) = oneshot::channel::<String>();
+            let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
             tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens)
-                    .unwrap_or_else(|| "[no engine for model]".to_string());
+                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
+                if result.is_none() {
+                    log::warn!("OPoI: inference returned no result for id={} — AiResponse will be skipped", stable_id);
+                }
                 let _ = tx_done.send(result);
             });
             self.inference_rx = Some((raw, rx_done));
@@ -389,9 +437,15 @@ impl KeryxdHandler {
         let Some((raw, mut rx)) = self.inference_rx.take() else {
             return false;
         };
-        let Ok(result) = rx.try_recv() else {
+        let Ok(result_opt) = rx.try_recv() else {
             self.inference_rx = Some((raw, rx));
             return false;
+        };
+        let Some(result) = result_opt else {
+            // Inference returned None: model not ready or think block exhausted max_tokens.
+            // Do NOT upload anything to IPFS — skip this AiResponse entirely.
+            info!("OPoI: inference produced no result — AiResponse skipped");
+            return true;
         };
 
         let full_hash = blake2b_simd::blake2b(&raw);
@@ -480,9 +534,45 @@ impl KeryxdHandler {
                         self.last_known_daa = daa;
                     }
                 }
+                // Handle node-issued inference challenge: spawn an inference task if a new
+                // challenge arrived and no challenge is already in flight.
+                if !template.inference_challenge.is_empty() && self.challenge_inference_rx.is_none() {
+                    let challenge = template.inference_challenge.clone();
+                    let mut parts = challenge.splitn(2, ':');
+                    let model_id_hex = parts.next().unwrap_or("").to_string();
+                    let nonce_hex = parts.next().unwrap_or("").to_string();
+                    if let Ok(model_id_bytes) = hex::decode(&model_id_hex) {
+                        if model_id_bytes.len() == 32 {
+                            let mut model_id = [0u8; 32];
+                            model_id.copy_from_slice(&model_id_bytes);
+                            if keryx_miner::slm::is_model_ready(&model_id) {
+                                info!("OPoI: challenge received model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);
+                                let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
+                                let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
+                                tokio::task::spawn_blocking(move || {
+                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 32);
+                                    let _ = tx_done.send(result);
+                                });
+                                self.challenge_inference_rx = Some((challenge, rx_done));
+                            } else {
+                                warn!("OPoI: challenge for unready model={:.8} — cannot respond", model_id_hex);
+                            }
+                        }
+                    }
+                }
                 // Poll in-flight inference; if done, submit AiResponse tx then get fresh template.
                 if self.poll_inference().await {
                     self.client_get_block_template().await?;
+                    return Ok(());
+                }
+                // OPoI is mandatory: refuse to mine if no models are ready.
+                // Covers miners with missing/truncated model files that somehow passed prefetch.
+                if keryx_miner::slm::loaded_model_ids().is_empty() {
+                    // Throttle to one log per ~200 templates (~every 20s at 10 BPS) to avoid spam.
+                    if self.last_known_daa % 200 == 0 {
+                        log::warn!("OPoI: no models ready — mining suspended until model files are available");
+                    }
+                    miner.process_block(None).await?;
                     return Ok(());
                 }
                 if let Some(ref block) = template.block {
