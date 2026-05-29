@@ -112,25 +112,27 @@ fn ensure_safetensors(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path
     let dir = model_dir(spec);
     let tok = dir.join("tokenizer.json");
     let cfg = dir.join("config.json");
+    let ok_flag = dir.join(".ok");
     let wts: Vec<_> = spec.weight_cids.iter().enumerate().map(|(i, _)| {
         if spec.weight_cids.len() == 1 { dir.join("model.safetensors") }
         else { dir.join(format!("model-{:05}-of-{:05}.safetensors", i + 1, spec.weight_cids.len())) }
     }).collect();
 
-    if tok.exists() && cfg.exists() && wts.iter().all(|p| p.exists()) {
+    // .ok sentinel written only after a complete download — guards against truncated files
+    if tok.exists() && cfg.exists() && wts.iter().all(|p| p.exists()) && ok_flag.exists() {
         log::info!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, cfg, wts));
     }
     std::fs::create_dir_all(&dir)?;
+    let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
     eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
     if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
     if !cfg.exists() { download_file(&ipfs_url(spec.config_cid), &cfg)?; }
     for (i, (cid, path)) in spec.weight_cids.iter().zip(wts.iter()).enumerate() {
-        if !path.exists() {
-            if spec.weight_cids.len() > 1 { eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len()); }
-            download_file(&ipfs_url(cid), path)?;
-        }
+        if spec.weight_cids.len() > 1 { eprintln!("[keryx-miner] Shard {}/{}", i + 1, spec.weight_cids.len()); }
+        download_file(&ipfs_url(cid), path)?;
     }
+    std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
     Ok((tok, cfg, wts))
 }
@@ -139,15 +141,19 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     let dir = model_dir(spec);
     let tok = dir.join("tokenizer.json");
     let gguf = dir.join("model.gguf");
+    let ok_flag = dir.join(".ok");
 
-    if tok.exists() && gguf.exists() {
+    // .ok sentinel written only after a complete download — guards against truncated files
+    if tok.exists() && gguf.exists() && ok_flag.exists() {
         log::info!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
     std::fs::create_dir_all(&dir)?;
+    let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
     eprintln!("\n[keryx-miner] Downloading model '{}' via IPFS. This happens once.\n", spec.name);
     if !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
-    if !gguf.exists() { download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?; }
+    download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
+    std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     eprintln!("[keryx-miner] Model '{}' ready.\n", spec.name);
     Ok((tok, gguf))
 }
@@ -361,7 +367,16 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
     // R1 models spend tokens on chain-of-thought before the visible answer.
     // Reserve extra budget so the think block never eats the entire quota and
     // leaves no room for </think> + the actual response.
-    let think_overhead = if is_think_primed { 512usize } else { 0 };
+    // R1-32B reasons more extensively than 8B — give it more overhead to avoid
+    // the think block consuming all steps and producing an empty answer.
+    let think_overhead = if is_think_primed {
+        match engine.name {
+            "deepseek-r1-32b" => 1536,
+            _ => 512,
+        }
+    } else {
+        0
+    };
     let max_steps = max_new_tokens.saturating_add(think_overhead).min(model_max);
 
     match &mut engine.inner {
@@ -475,7 +490,8 @@ pub fn init_supported(specs: &'static [&'static ModelSpec]) {
 ///
 /// Does not load weights into GPU memory — just ensures files are on disk so
 /// the first inference request doesn't stall the mining workers mid-session.
-pub fn prefetch_models(specs: &'static [&'static ModelSpec]) {
+/// Returns Err if any model fails to download; mining must not start in that case.
+pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     for spec in specs {
         log::info!("SlmEngine: prefetching model '{}'…", spec.name);
         let result = match spec.format {
@@ -484,16 +500,30 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) {
         };
         match result {
             Ok(()) => log::info!("SlmEngine: '{}' files ready.", spec.name),
-            Err(e) => log::warn!("SlmEngine: prefetch '{}' failed: {} — will retry on first request.", spec.name, e),
+            Err(e) => {
+                log::error!("SlmEngine: prefetch '{}' failed: {} — cannot start mining.", spec.name, e);
+                return Err(e);
+            }
         }
     }
+    Ok(())
 }
 
-/// Return the model_ids of all supported models (used for coinbase capability announcement).
+/// Return the model_ids of supported models that have fully-downloaded files (.ok flag present).
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     SUPPORTED_SPECS.get()
-        .map(|specs| specs.iter().map(|s| s.model_id).collect())
+        .map(|specs| specs.iter()
+            .filter(|s| model_dir(s).join(".ok").exists())
+            .map(|s| s.model_id)
+            .collect())
         .unwrap_or_default()
+}
+
+/// True only when the model is supported and its files are completely downloaded.
+pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
+    let Some(specs) = SUPPORTED_SPECS.get() else { return false; };
+    let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
+    model_dir(spec).join(".ok").exists()
 }
 
 /// Load the requested model on demand (evicting a cached different model if needed),

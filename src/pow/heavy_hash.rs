@@ -2,10 +2,19 @@ use crate::pow::{hasher::HeavyHasher, xoshiro::XoShiRo256PlusPlus};
 use crate::Hash;
 use std::mem::MaybeUninit;
 
-/// Domain-separation salt — must match `KERYX_MATRIX_SALT` in
+/// Domain-separation salts — must match `KERYX_MATRIX_SALT_V1/V2` in
 /// `consensus/pow/src/matrix.rs` exactly or the miner will derive a different
 /// matrix than the node and every submitted block will be rejected.
-const KERYX_MATRIX_SALT: [u8; 32] = *b"KERYX:KeryxHash-v1:2026-04-12:xx";
+const KERYX_MATRIX_SALT_V1: [u8; 32] = *b"KERYX:KeryxHash-v1:2026-04-12:xx";
+const KERYX_MATRIX_SALT_V2: [u8; 32] = *b"KERYX:KeryxHash-v2:2026-05-29:xx";
+
+/// DAA score at which the miner switches to SALT v2 — must match `pow_salt_v2_activation`
+/// in network params. Miners compiled before this update will keep using v1 and their
+/// blocks will be rejected after activation — that is the forced-update mechanism.
+///
+/// Mainnet: 17_275_000 (2026-05-30 ~15:00 UTC emergency activation)
+/// Testnet: 6_000
+pub const POW_SALT_V2_ACTIVATION_DAA: u64 = 17_275_000;
 
 /// Round constants for wave_mix — same as `WAVE_MIX_KEYS` in matrix.rs.
 const WAVE_MIX_KEYS: [u64; 4] = [
@@ -47,12 +56,13 @@ pub struct Matrix(pub [[u16; 64]; 64]);
 
 impl Matrix {
     #[inline(always)]
-    pub fn generate(hash: Hash) -> Self {
-        // XOR the block-hash seed with the Keryx domain salt before the PRNG.
+    pub fn generate(hash: Hash, use_v2_salt: bool) -> Self {
+        // XOR the block-hash seed with the active Keryx domain salt before the PRNG.
         // Must match Matrix::generate() in consensus/pow/src/matrix.rs.
+        let salt = if use_v2_salt { &KERYX_MATRIX_SALT_V2 } else { &KERYX_MATRIX_SALT_V1 };
         let salted = {
             let mut bytes = hash.to_le_bytes();
-            bytes.iter_mut().zip(KERYX_MATRIX_SALT.iter()).for_each(|(b, s)| *b ^= s);
+            bytes.iter_mut().zip(salt.iter()).for_each(|(b, s)| *b ^= s);
             Hash::from_le_bytes(bytes)
         };
         let mut generator = XoShiRo256PlusPlus::new(salted);
@@ -343,7 +353,7 @@ mod tests {
             [10, 5, 11, 14, 12, 1, 12, 7, 12, 8, 10, 5, 6, 10, 0, 7, 5, 6, 11, 11, 13, 12, 0, 13, 0, 6, 11, 0, 14, 4, 2, 1, 12, 7, 1, 10, 7, 15, 5, 3, 14, 15, 1, 3, 1, 2, 10, 4, 11, 8, 2, 11, 2, 5, 5, 4, 15, 5, 10, 3, 1, 7, 2, 14],
         ]);
         let hash = Hash::from_le_bytes([42; 32]);
-        let matrix = Matrix::generate(hash);
+        let matrix = Matrix::generate(hash, false);
         assert_eq!(matrix, expected_matrix);
     }
 }

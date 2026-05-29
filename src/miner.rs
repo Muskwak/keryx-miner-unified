@@ -98,6 +98,7 @@ pub struct MinerManager {
     hashes_tried: Arc<AtomicU64>,
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
     current_state_id: AtomicUsize,
+    opoi_challenge_active: Arc<AtomicBool>,
 }
 
 impl Drop for MinerManager {
@@ -137,6 +138,7 @@ impl MinerManager {
         register_freeze_handler();
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
+        let opoi_challenge_active = Arc::new(AtomicBool::new(false));
         let (send, recv) = watch::channel(None);
         let mut handles =
             Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus)
@@ -154,11 +156,16 @@ impl MinerManager {
             handles,
             block_channel: send,
             send_channel,
-            logger_handle: task::spawn(Self::log_hashrate(Arc::clone(&hashes_tried), hashes_by_worker.clone())),
+            logger_handle: task::spawn(Self::log_hashrate(
+                Arc::clone(&hashes_tried),
+                hashes_by_worker.clone(),
+                Arc::clone(&opoi_challenge_active),
+            )),
             is_synced: true,
             hashes_tried,
             current_state_id: AtomicUsize::new(0),
             hashes_by_worker,
+            opoi_challenge_active,
         }
     }
 
@@ -197,6 +204,10 @@ impl MinerManager {
         vec
     }
 
+    pub fn opoi_challenge_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.opoi_challenge_active)
+    }
+
     pub async fn process_block(&mut self, block: Option<BlockSeed>) -> Result<(), Error> {
         let state = match block {
             Some(b) => {
@@ -209,7 +220,11 @@ impl MinerManager {
                     return Ok(());
                 }
                 self.is_synced = false;
-                warn!("Keryxd is not synced, skipping current template");
+                if self.opoi_challenge_active.load(Ordering::Relaxed) {
+                    info!("OPoI challenge in progress — PoW template suspended, stand by");
+                } else {
+                    warn!("Keryxd is not synced, skipping current template");
+                }
                 None
             }
         };
@@ -409,22 +424,28 @@ impl MinerManager {
         })
     }
 
-    async fn log_hashrate(hashes_tried: Arc<AtomicU64>, hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>) {
+    async fn log_hashrate(
+        hashes_tried: Arc<AtomicU64>,
+        hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
+        opoi_challenge_active: Arc<AtomicBool>,
+    ) {
         let mut ticker = tokio::time::interval(LOG_RATE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_instant = ticker.tick().await;
         loop {
             let now = ticker.tick().await;
             let duration = (now - last_instant).as_secs_f64();
+            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed);
             Self::log_single_hashrate(
                 &hashes_tried,
                 "Current hashrate is".into(),
                 "Workers stalled or crashed. Considered reducing workload and check that your node is synced",
                 duration,
                 false,
+                challenge_active,
             );
             for (device, rate) in &*hashes_by_worker.lock().unwrap() {
-                Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true);
+                Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true, challenge_active);
             }
             last_instant = now;
         }
@@ -436,15 +457,24 @@ impl MinerManager {
         warn_message: &str,
         duration: f64,
         keep_prefix: bool,
+        challenge_active: bool,
     ) {
         let hashes = counter.swap(0, Ordering::AcqRel);
         let rate = (hashes as f64) / duration;
         if hashes == 0 {
-            match keep_prefix {
-                true => warn!("{}{}", prefix, warn_message),
-                false => warn!("{}", warn_message),
-            };
-        } else if hashes != 0 {
+            if challenge_active {
+                if keep_prefix {
+                    info!("{} OPoI challenge in progress — stand by", prefix);
+                } else {
+                    info!("OPoI challenge in progress — PoW paused, stand by");
+                }
+            } else {
+                match keep_prefix {
+                    true => warn!("{}{}", prefix, warn_message),
+                    false => warn!("{}", warn_message),
+                };
+            }
+        } else {
             let (rate, suffix) = Self::hash_suffix(rate);
             info!("{} {:.2} {}", prefix, rate, suffix);
         }

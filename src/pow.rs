@@ -16,7 +16,7 @@ use crate::{
 use keryx_miner::Worker;
 
 mod hasher;
-mod heavy_hash;
+pub(crate) mod heavy_hash;
 mod keccak;
 mod xoshiro;
 
@@ -79,6 +79,7 @@ impl State {
         let header_target;
         let nonce_mask: u64;
         let nonce_fixed: u64;
+        let daa_score: u64;
         match block_seed {
             BlockSeed::FullBlock(ref block) => {
                 let header = &block.header.as_ref().ok_or("Header is missing")?;
@@ -88,6 +89,7 @@ impl State {
                 serialize_header(&mut hasher, header, true);
                 pre_pow_hash = hasher.finalize();
                 header_timestamp = header.timestamp as u64;
+                daa_score = header.daa_score;
                 nonce_mask = 0xffffffffffffffffu64;
                 nonce_fixed = 0;
             }
@@ -102,14 +104,16 @@ impl State {
                 pre_pow_hash = Hash::new(*header_hash);
                 header_timestamp = *timestamp;
                 header_target = *target;
+                daa_score = 0; // stratum shares have no daa_score; always use v1 salt
                 nonce_mask = mask;
                 nonce_fixed = fixed
             }
         }
 
+        let use_v2 = daa_score >= crate::pow::heavy_hash::POW_SALT_V2_ACTIVATION_DAA;
         // PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
         let hasher = PowHasher::new(pre_pow_hash, header_timestamp);
-        let matrix = Arc::new(Matrix::generate(pre_pow_hash));
+        let matrix = Arc::new(Matrix::generate(pre_pow_hash, use_v2));
         let mut pow_hash_header = [0u8; 72];
 
         pow_hash_header.copy_from_slice(
