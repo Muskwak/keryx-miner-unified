@@ -82,6 +82,12 @@ pub(crate) enum StratumCommand {
     Authorize((String, String)),
     #[serde(rename = "mining.submit")]
     MiningSubmit(MiningSubmit),
+    // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
+    #[serde(rename = "mining.challenge")]
+    MiningChallenge((String, String)),
+    // Phase 2 OPoI: miner → bridge — "model_id_hex:result_text" challenge response
+    #[serde(rename = "mining.challenge_response")]
+    MiningChallengeResponse((String, String)),
     /*#[serde(rename = "mining.submit_hashrate")]
     MiningSubmitHashrate {
         params: (String, String),

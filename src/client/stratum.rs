@@ -2,7 +2,7 @@ use futures::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -36,6 +36,7 @@ use tokio_stream::wrappers::ReceiverStream;
 const DIFFICULTY_1_TARGET: (u64, i16) = (0xffffu64, 208); // 0xffff 2^208
 const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
 const LOG_RATE: Duration = Duration::from_secs(30);
+const CHALLENGE_MAX_TOKENS: usize = 128;
 
 // ── Phase 2 OPoI — inference cache & task types ─────────────────────────────
 
@@ -142,6 +143,8 @@ pub struct StratumHandler {
     current_task_slot: Arc<Mutex<Option<CurrentTask>>>,
     /// Completed inferences: stable_id → base58 CIDv0 string (persists across block changes).
     inference_cache: InferenceCache,
+    /// True while a capability challenge inference is in flight — prevents duplicate spawns.
+    challenge_in_flight: Arc<AtomicBool>,
 }
 
 #[async_trait(?Send)]
@@ -271,6 +274,7 @@ impl StratumHandler {
             ipfs_url,
             current_task_slot,
             inference_cache,
+            challenge_in_flight: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -462,6 +466,10 @@ impl StratumHandler {
                                 }))
                                 .await
                         }
+                        StratumCommand::MiningChallenge((model_id_hex, nonce_hex)) => {
+                            self.handle_challenge(model_id_hex, nonce_hex).await;
+                            Ok(())
+                        }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
                     },
                     _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
@@ -549,6 +557,59 @@ impl StratumHandler {
 
     /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,
     /// and spawn a background inference+IPFS upload if the result is not already cached.
+    /// Handle a `mining.challenge` from the bridge.
+    ///
+    /// The bridge relays the node's periodic capability challenge: the miner must prove
+    /// it has the requested model loaded and can produce inference output. The result is
+    /// sent back as `mining.challenge_response` so the bridge can forward it to the node.
+    async fn handle_challenge(&self, model_id_hex: String, nonce_hex: String) {
+        // Only one challenge in flight at a time — bridge will re-challenge if needed.
+        if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            warn!("OPoI challenge: already in flight, dropping new challenge for model {:.8}", model_id_hex);
+            return;
+        }
+
+        let model_id_bytes = match hex::decode(&model_id_hex) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                warn!("OPoI challenge: invalid model_id_hex '{}'", model_id_hex);
+                self.challenge_in_flight.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        let mut model_id = [0u8; 32];
+        model_id.copy_from_slice(&model_id_bytes);
+
+        if !keryx_miner::slm::is_model_ready(&model_id) {
+            warn!("OPoI challenge: model {:.8} not ready — sending empty response", model_id_hex);
+            self.challenge_in_flight.store(false, Ordering::SeqCst);
+            self.send_channel.send(make_challenge_response_line(&model_id_hex, "")).await.ok();
+            return;
+        }
+
+        info!("OPoI challenge: model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);
+
+        let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
+        let send_channel = self.send_channel.clone();
+        let flag = Arc::clone(&self.challenge_in_flight);
+
+        tokio::task::spawn_blocking(move || {
+            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
+            let text = result.unwrap_or_default();
+            flag.store(false, Ordering::SeqCst);
+            if text.is_empty() {
+                warn!("OPoI challenge: inference returned empty text for model {:.8}", model_id_hex);
+            } else {
+                info!("OPoI challenge: done for model {:.8} ({} chars)", model_id_hex, text.len());
+            }
+            let line = make_challenge_response_line(&model_id_hex, &text);
+            if send_channel.blocking_send(line).is_err() {
+                warn!("OPoI challenge: send_channel closed, could not deliver response");
+            }
+        });
+    }
+
+    /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,
     async fn handle_ai_task(&mut self, job_id: String, task_json: String) {
         let task: AiTask = match serde_json::from_str(&task_json) {
             Ok(t) => t,
@@ -631,6 +692,18 @@ fn run_inference_and_upload(
     guard.in_progress.remove(&stable_id);
     if let Some(cid) = cid_opt {
         guard.results.insert(stable_id, cid);
+    }
+}
+
+fn make_challenge_response_line(model_id_hex: &str, result: &str) -> StratumLine {
+    StratumLine {
+        id: None,
+        payload: StratumLinePayload::StratumCommand(StratumCommand::MiningChallengeResponse((
+            model_id_hex.to_string(),
+            result.to_string(),
+        ))),
+        jsonrpc: None,
+        error: None,
     }
 }
 
