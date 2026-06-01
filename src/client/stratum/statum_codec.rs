@@ -45,6 +45,7 @@ pub(crate) enum MiningNotify {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum MiningSubmit {
+    MiningSubmitWithTag((String, String, String, String)), // address, job_id, nonce, opoi_tag
     MiningSubmitShort((String, String, String)),
     MiningSubmitLong((String, String, String, String, String)),
 }

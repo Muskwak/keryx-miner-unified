@@ -245,13 +245,16 @@ impl StratumHandler {
                             id.clone(), //block_seed.clone()
                         );
                     }
+                    let nonce_hex = format!("{:016x}", nonce);
+                    let opoi_tag = keryx_inference::tag_fixed(*nonce);
                     StratumLine {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
-                            MiningSubmit::MiningSubmitShort((
+                            MiningSubmit::MiningSubmitWithTag((
                                 miner_address.clone(),
                                 id.into(),
-                                format!("{:016x}", nonce),
+                                nonce_hex,
+                                opoi_tag,
                             )),
                         )),
                         jsonrpc: None,
