@@ -426,6 +426,13 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+                            if keryx_miner::slm::loaded_model_ids().is_empty() {
+                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
+                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
+                                }
+                                return miner.process_block(None).await;
+                            }
                             let inference_started =
                                 self.handle_ai_task(id.clone(), task_json, miner).await;
                             if inference_started {
@@ -457,6 +464,13 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+                            if keryx_miner::slm::loaded_model_ids().is_empty() {
+                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
+                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
+                                }
+                                return miner.process_block(None).await;
+                            }
                             // No AiRequest in this job — clear the task slot.
                             *self.current_task_slot.lock().await = None;
                             miner
@@ -477,6 +491,13 @@ impl StratumHandler {
                             self.block_template_ctr
                                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000))
                                 .unwrap();
+                            // OPoI hard gate (mirrors solo grpc.rs): no models ready = no mining.
+                            if keryx_miner::slm::loaded_model_ids().is_empty() {
+                                if self.block_template_ctr.load(Ordering::SeqCst) % 200 == 0 {
+                                    warn!("OPoI: no models ready — mining suspended (no inference = no mining)");
+                                }
+                                return miner.process_block(None).await;
+                            }
                             *self.current_task_slot.lock().await = None;
                             miner
                                 .process_block(Some(PartialBlock {
