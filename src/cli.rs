@@ -33,6 +33,13 @@ pub struct Opt {
     pub very_high: bool,
 
     #[clap(
+        long = "cpu-inference",
+        help = "Run OPoI inference on the CPU instead of the GPU — frees the GPU for hashing and avoids weak-fp16 GPUs (e.g. GTX 1060). Pairs well with --light.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub cpu_inference: bool,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",

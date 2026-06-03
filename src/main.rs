@@ -376,6 +376,10 @@ async fn main() -> Result<(), Error> {
         &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
     };
     keryx_miner::slm::init_supported(specs);
+    keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
+    if opt.cpu_inference {
+        info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
+    }
     info!("OPoI Phase-3 active — {} model(s) supported.", specs.len());
     info!("Prefetching model files before mining starts…");
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs)).await {
@@ -391,6 +395,9 @@ async fn main() -> Result<(), Error> {
     }
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
+    if opt.cpu_inference {
+        info!("--cpu-inference: skipping GPU inference probe (inference runs on CPU).");
+    } else {
     info!("Probing GPU inference (cuBLAS) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
         Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS loaded successfully."),
@@ -430,6 +437,7 @@ async fn main() -> Result<(), Error> {
             error!("GPU probe task panicked: {}", e);
             return Err(e.into());
         }
+    }
     }
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);

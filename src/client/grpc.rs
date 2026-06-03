@@ -602,7 +602,10 @@ impl KeryxdHandler {
                 self.try_start_inference();
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
                 // This covers both regular AiRequest inference and node-issued challenge inference.
-                if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
+                // In --cpu-inference mode the GPU is free, so keep hashing during inference.
+                if (self.inference_rx.is_some() || self.challenge_inference_rx.is_some())
+                    && !keryx_miner::slm::cpu_inference_enabled()
+                {
                     miner.process_block(None).await?;
                     return Ok(());
                 }

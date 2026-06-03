@@ -11,6 +11,7 @@ use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
 use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 use tokenizers::Tokenizer;
 
@@ -41,6 +42,21 @@ const SYSTEM_PROMPT_LLAMA70B: &str =
 
 static SUPPORTED_SPECS: OnceLock<&'static [&'static ModelSpec]> = OnceLock::new();
 static ENGINE: Mutex<Option<SlmEngine>> = Mutex::new(None);
+
+/// When true, OPoI inference is forced onto the CPU even if a CUDA device is present.
+/// Set once at startup from the `--cpu-inference` CLI flag so weak GPUs (e.g. GTX 1060)
+/// can dedicate the GPU to hashing while the CPU runs the SLM.
+static FORCE_CPU_INFERENCE: AtomicBool = AtomicBool::new(false);
+
+/// Force OPoI inference onto the CPU (see [`FORCE_CPU_INFERENCE`]). Call once at startup.
+pub fn set_cpu_inference(enabled: bool) {
+    FORCE_CPU_INFERENCE.store(enabled, AtomicOrdering::Relaxed);
+}
+
+/// Whether OPoI inference is forced onto the CPU.
+pub fn cpu_inference_enabled() -> bool {
+    FORCE_CPU_INFERENCE.load(AtomicOrdering::Relaxed)
+}
 
 enum ModelInner {
     Full { model: Llama, config: Config, cache_dtype: DType },
@@ -607,9 +623,14 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
                 log::info!("SlmEngine: evicting '{}' to load '{}'", old.name, spec.name);
             }
             *guard = None;
-            let device = match Device::new_cuda(0) {
-                Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
-                Err(e) => { log::warn!("SlmEngine: CUDA unavailable ({e}) — CPU fallback"); Device::Cpu }
+            let device = if cpu_inference_enabled() {
+                log::info!("SlmEngine: --cpu-inference set — running on CPU device");
+                Device::Cpu
+            } else {
+                match Device::new_cuda(0) {
+                    Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
+                    Err(e) => { log::warn!("SlmEngine: CUDA unavailable ({e}) — CPU fallback"); Device::Cpu }
+                }
             };
             match load_engine(spec, device) {
                 Ok(e) => { *guard = Some(e); }
