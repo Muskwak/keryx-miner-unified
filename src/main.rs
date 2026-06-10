@@ -127,7 +127,7 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 ///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
-fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
+fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: bool) {
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=power.limit,power.max_limit,memory.total",
@@ -135,14 +135,26 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
         ])
         .output();
 
+    // nvidia-smi prints one line per GPU. The power check applies to GPU 0;
+    // for VRAM, --vram-pool combines every CUDA device (layer-split inference),
+    // so the gate must consider their summed capacity.
     let (current_w, vram_mb) = match output {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            let mut parts = s.trim().split(',');
-            let cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-            let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-            let vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-            (cur as u32, vram)
+            let mut cur = 0u32;
+            let mut vram = 0u64;
+            let gpu_limit = if vram_pool { usize::MAX } else { 1 };
+            for (i, line) in s.trim().lines().take(gpu_limit).enumerate() {
+                let mut parts = line.split(',');
+                let line_cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+                let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+                let line_vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                if i == 0 {
+                    cur = line_cur as u32;
+                }
+                vram += line_vram;
+            }
+            (cur, vram)
         }
         _ => return,
     };
@@ -152,10 +164,11 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     // OOMs on this quant, so it is gated out here.
     if needs_very_high && vram_mb < 46_000 {
         log::error!(
-            "✗  LLaMA-3.3-70B (Q4_K_M) requires ≥46 GB VRAM (48 GB card: RTX 6000 Ada / A6000 / RTX PRO 5000) — \
-             this GPU has only {} MB ({} GB).",
+            "✗  LLaMA-3.3-70B (Q4_K_M) requires ≥46 GB VRAM (48 GB card: RTX 6000 Ada / A6000 / RTX PRO 5000, \
+             or 2 GPUs pooled with --vram-pool) — only {} MB ({} GB) {}.",
             vram_mb,
-            vram_mb / 1024
+            vram_mb / 1024,
+            if vram_pool { "pooled across all GPUs" } else { "on this GPU" }
         );
         log::error!(
             "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
@@ -353,7 +366,7 @@ async fn main() -> Result<(), Error> {
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
+    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high, opt.vram_pool);
 
     let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
         info!("--very-high mode: loading all 4 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + LLaMA-70B).");
@@ -380,6 +393,10 @@ async fn main() -> Result<(), Error> {
     keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
     if opt.cpu_inference {
         info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
+    }
+    keryx_miner::slm::set_vram_pool(opt.vram_pool);
+    if opt.vram_pool {
+        info!("--vram-pool mode (EXPERIMENTAL): GGUF model layers split evenly across all CUDA devices.");
     }
     info!("OPoI Phase-3 active — {} model(s) supported.", specs.len());
     info!("Prefetching model files before mining starts…");

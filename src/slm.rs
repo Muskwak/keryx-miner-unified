@@ -10,6 +10,7 @@ use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
 use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
+use crate::quantized_llama_split::ModelWeights as SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
@@ -58,9 +59,26 @@ pub fn cpu_inference_enabled() -> bool {
     FORCE_CPU_INFERENCE.load(AtomicOrdering::Relaxed)
 }
 
+/// When true, GGUF models are loaded with their layers split evenly across all
+/// available CUDA devices (layer-split VRAM pooling). Set once at startup from
+/// the `--vram-pool` CLI flag. EXPERIMENTAL.
+static VRAM_POOL: AtomicBool = AtomicBool::new(false);
+
+/// Enable layer-split VRAM pooling across all CUDA GPUs (see [`VRAM_POOL`]). Call once at startup.
+pub fn set_vram_pool(enabled: bool) {
+    VRAM_POOL.store(enabled, AtomicOrdering::Relaxed);
+}
+
+/// Whether layer-split VRAM pooling is enabled.
+pub fn vram_pool_enabled() -> bool {
+    VRAM_POOL.load(AtomicOrdering::Relaxed)
+}
+
 enum ModelInner {
     Full { model: Llama, config: Config, cache_dtype: DType },
     Quantized(ModelWeights),
+    /// GGUF llama-arch model with layers split across multiple CUDA devices (--vram-pool).
+    QuantizedSplit(SplitWeights),
     QuantizedQwen2(Qwen2Weights),
 }
 
@@ -235,6 +253,20 @@ fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str
     }
 }
 
+/// Enumerate every available CUDA device for --vram-pool, starting from the
+/// already-open primary device (ordinal 0). Stops at the first ordinal that
+/// fails to open.
+fn cuda_pool_devices(primary: &Device) -> Vec<Device> {
+    let mut devices = vec![primary.clone()];
+    for ordinal in 1.. {
+        match Device::new_cuda(ordinal) {
+            Ok(d) => devices.push(d),
+            Err(_) => break,
+        }
+    }
+    devices
+}
+
 fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
 
@@ -268,13 +300,38 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
-                .map_err(|e| anyhow!("load gguf weights: {}", e))?;
+            // --vram-pool: split layers evenly across every CUDA device so the
+            // pooled VRAM can hold models no single card fits. Falls back to a
+            // regular single-device load when only one GPU is present.
+            let inner = if vram_pool_enabled() && device.is_cuda() {
+                let devices = cuda_pool_devices(&device);
+                if devices.len() >= 2 {
+                    log::info!(
+                        "SlmEngine: --vram-pool — splitting '{}' layers evenly across {} GPUs",
+                        spec.name,
+                        devices.len()
+                    );
+                    let model = SplitWeights::from_gguf(content, &mut gguf_file, &devices)
+                        .map_err(|e| anyhow!("load gguf weights (split): {}", e))?;
+                    ModelInner::QuantizedSplit(model)
+                } else {
+                    log::warn!(
+                        "SlmEngine: --vram-pool set but only one CUDA device found — single-GPU load"
+                    );
+                    let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
+                        .map_err(|e| anyhow!("load gguf weights: {}", e))?;
+                    ModelInner::Quantized(model)
+                }
+            } else {
+                let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
+                    .map_err(|e| anyhow!("load gguf weights: {}", e))?;
+                ModelInner::Quantized(model)
+            };
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
-                inner: ModelInner::Quantized(model),
+                inner,
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
@@ -419,6 +476,26 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
             }
         }
         ModelInner::Quantized(model) => {
+            for step in 0..max_steps {
+                let (input_ids, pos) = if step == 0 {
+                    (all_tokens.as_slice(), 0usize)
+                } else {
+                    let last = all_tokens.len() - 1;
+                    (&all_tokens[last..], last)
+                };
+                let input = Tensor::new(input_ids, &engine.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| anyhow!("input tensor: {}", e))?;
+                let logits = model.forward(&input, pos)
+                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
+                all_tokens.push(next);
+                generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+            }
+        }
+        ModelInner::QuantizedSplit(model) => {
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)

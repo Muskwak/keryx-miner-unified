@@ -40,6 +40,14 @@ pub struct Opt {
     pub cpu_inference: bool,
 
     #[clap(
+        long = "vram-pool",
+        help = "EXPERIMENTAL: pool the VRAM of all CUDA GPUs by splitting GGUF model layers evenly across them (layer-split inference). Lets a multi-GPU rig serve models no single card can hold (e.g. 2x 24GB for LLaMA-3.3-70B, 3x+ 8GB for DeepSeek-R1-32B). Falls back to single-GPU when only one device is present.",
+        help_heading = "OPoI / Inference",
+        conflicts_with = "cpu_inference"
+    )]
+    pub vram_pool: bool,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",
