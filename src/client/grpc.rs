@@ -24,6 +24,15 @@ use tonic::{transport::Channel as TonicChannel, Streaming};
 static EXTRA_DATA: &str = concat!(env!("CARGO_PKG_VERSION"), "/", env!("PACKAGE_COMPILE_TIME"));
 type BlockHandle = JoinHandle<Result<(), PollSendError<KaspadMessage>>>;
 
+/// OPoI v2 hardfork activation DAA — MUST match `opoi_v2_activation` in keryx-node params.rs.
+/// From this score AiResponse txs use the 142-byte v2 payload (model_id + result_commitment).
+/// TODO(hardfork): set to the concrete H before the v0.4.0 release.
+pub const OPOI_V2_ACTIVATION_DAA: u64 = u64::MAX;
+
+/// Stop publishing AiResponses this many DAA before the gate (~1 min at 10 BPS) so a
+/// v1-format tx cannot land in a ≥ H block during the submission→inclusion delay.
+const OPOI_V2_GATE_PAUSE: u64 = 600;
+
 #[allow(dead_code)]
 pub struct KeryxdHandler {
     client: RpcClient<TonicChannel>,
@@ -483,9 +492,30 @@ impl KeryxdHandler {
             Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
         };
 
+        // OPoI v2 gate: don't publish inside the transition window — a v1 tx mined ≥ H
+        // (or a v2 tx mined < H) would invalidate the containing block.
+        let daa = self.last_known_daa;
+        if daa < OPOI_V2_ACTIVATION_DAA && daa.saturating_add(OPOI_V2_GATE_PAUSE) >= OPOI_V2_ACTIVATION_DAA {
+            info!(
+                "OPoI: within the v2 gate transition window — response skipped, resuming in v2 format at DAA {}",
+                OPOI_V2_ACTIVATION_DAA
+            );
+            return true;
+        }
+
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
-        let resp = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+        let resp = if daa >= OPOI_V2_ACTIVATION_DAA {
+            // V2: embed the claimed model_id (checked against our ai:cap by consensus) and
+            // commit to the exact bytes uploaded to IPFS (blake2b-256 prefix, like request_hash).
+            let model_id = keryx_inference::AiRequestPayload::deserialize(&raw).map(|r| r.model_id).unwrap_or([0u8; 32]);
+            let commitment_full = blake2b_simd::blake2b(result.as_bytes());
+            let mut result_commitment = [0u8; 32];
+            result_commitment.copy_from_slice(&commitment_full.as_bytes()[..32]);
+            keryx_inference::AiResponsePayload::new_v2(request_hash, challenge_window_end, cid, response_length, model_id, result_commitment)
+        } else {
+            keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length)
+        };
         info!("OPoI: uploading response CID={}, challenge_window_end={}", resp.cid_v0(), challenge_window_end);
 
         let rpc_tx = crate::proto::RpcTransaction {

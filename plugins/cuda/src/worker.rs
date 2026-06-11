@@ -13,6 +13,7 @@ use std::sync::{Arc, Weak};
 
 static BPS: f32 = 1.;
 
+static PTX_120: &str = include_str!("../resources/keryx-cuda-sm120.ptx");
 static PTX_100: &str = include_str!("../resources/keryx-cuda-sm100.ptx");
 static PTX_89: &str = include_str!("../resources/keryx-cuda-sm89.ptx");
 static PTX_86: &str = include_str!("../resources/keryx-cuda-sm86.ptx");
@@ -175,8 +176,28 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         // CUDA 13.2 (PTX ISA 9.2) which requires driver >= 570. If the driver is older, we
         // fall back to sm_86 (CUDA 12.0 / PTX 8.0, driver >= 520) which runs on all these
         // architectures via NVIDIA's backward-compatible PTX JIT.
-        if major >= 10 {
-            // sm_100+ (RTX 50 / Blackwell and future)
+        if major >= 12 {
+            // sm_120 (consumer Blackwell — GeForce RTX 5090 etc.). NVIDIA splits
+            // sm_100 (datacenter Blackwell — H100/B100) and sm_120 (consumer) as
+            // separate compute architectures, so the sm_100 PTX errors out with
+            // `unknown error` on a 5090 and the card used to land on JIT'd sm_86
+            // at roughly half the native throughput. The sm_120 PTX is ISA 9.0
+            // (driver >= 580); on older drivers we fall through to sm_86.
+            _module = Arc::new(match load_ptx(PTX_120, "sm_120") {
+                Ok(m) => {
+                    info!("GPU #{} using optimised sm_120 PTX", device_id);
+                    m
+                }
+                Err(e) => {
+                    info!("GPU #{} sm_120 PTX failed; trying sm_100 then sm_86 fallback (update driver to 580+)", device_id);
+                    match load_ptx(PTX_100, "sm_100") {
+                        Ok(m) => m,
+                        Err(_) => load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?,
+                    }
+                }
+            });
+        } else if major >= 10 {
+            // sm_100+ (datacenter Blackwell — H100 / B100 / GH100)
             _module = Arc::new(match load_ptx(PTX_100, "sm_100") {
                 Ok(m) => {
                     info!("GPU #{} using optimised sm_100 PTX", device_id);

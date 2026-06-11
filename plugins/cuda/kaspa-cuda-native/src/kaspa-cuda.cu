@@ -97,10 +97,76 @@ __device__ __inline__ void amul4bit(uint32_t packed_vec1[32], uint32_t packed_ve
 }
 
 
+/*
+ * Arch-specific launch bounds. On sm_80 (GA100 — A100 / CMP 170HX) the
+ * unrolled kernel naturally lands at 72 registers, which is just over
+ * the 65536/(2*512)=64 threshold, so it runs at only 1 block/SM (~25%
+ * occupancy) — the 170HX then idles at ~99W/250W, latency-bound. Forcing
+ * `__launch_bounds__(512, 2)` caps it at 64 regs (a trivial 12-byte
+ * spill) and unlocks 2 blocks/SM = 50% occupancy.
+ *
+ * Gated on __CUDA_ARCH__ so sm_120 (RTX 5090) is untouched — it already
+ * sits at 64 regs / 2 blocks/SM and is power-bound at 3.28 GH/s; pinning
+ * a block-size hint there could only constrain the driver's launch
+ * config, so we leave it alone.
+ */
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
+#define HEAVY_HASH_BOUNDS __launch_bounds__(512, 2)
+#else
+#define HEAVY_HASH_BOUNDS
+#endif
+
 extern "C" {
 
 
-    __global__ void heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
+    /*
+     * *** BIG WIN (2026-06): unroll the Keccak round loop ***
+     * `keccakf()` in keccak-tiny.c had a ROLLED `for (i=0;i<24;i++)`
+     * round loop. Rolled, the 25-lane state stayed an addressable
+     * local array (the rho/pi step indexes a[pi[x]]), which pinned the
+     * kernel at 229 regs offline / 126 regs after driver JIT → only
+     * 1 block/SM, 33% occupancy, and no cross-round ILP (fatal on a
+     * latency-bound kernel at low occupancy). Adding `#pragma unroll`
+     * to that loop lets the π-permutation become pure register
+     * renaming: 229 → 64 regs, 0 spill, 2 blocks/SM, and the runtime
+     * workload 4×'d (44M → 178M nonces). Measured 2.57 → 3.28 GH/s
+     * (+28%) on the 5090 at stock 575W. Shares accepted, 0 rejects.
+     * The card is now power-bound at the TDP cap rather than
+     * compute-bound; further kernel wins must cut energy-per-hash.
+     *
+     * --- earlier (now superseded) launch-config sweep ---
+     * Tried `__launch_bounds__(512, 2)` (force 2 blocks/SM by capping
+     * regs/thread at ~64). Measured 2.78 → 2.01 GH/s — the compiler
+     * spilled the Keccak f-1600 state to local memory and the latency
+     * blew up. (This was BEFORE the unroll: the rolled loop made 64
+     * regs impossible without spilling. Post-unroll, 64 regs fits
+     * naturally with 0 spill — the lever was the loop, not the bound.)
+     *
+     * Profiling baseline (nsight 2026.1.1, ncu --section SpeedOfLight,
+     * sm_120 RTX 5090, --light tier, 89 M-nonce launch):
+     *   Compute SM throughput    91.50 %        ← compute-bound
+     *   Memory throughput         1.87 %        ← entirely cached
+     *   Mem pipes busy            4.90 %
+     *   Registers per thread      126           ← hard limiter
+     *   Block size                512
+     *   Block limit (registers)   1
+     *   Theoretical occupancy     33.33 %
+     *   Achieved occupancy        32.44 %       ← ≈ theoretical
+     *   L1 hit rate              100 %          ← matrix lives in L1
+     *   L2 hit rate               91 %
+     *
+     * `__launch_bounds__(1024, 1)` (committed but later measured at
+     * 2.55 GH/s — also a regression). The cust runtime's
+     * cuOccupancyMaxPotentialBlockSize picks block_size=512 to
+     * maximize occupancy at the 126-reg compute. Forcing 1024 either
+     * blew up regs (compiler had to budget across 1024 threads) or
+     * inflated the in-flight warp count past the SM scheduler's
+     * sweet spot — either way, slower.
+     *
+     * Net of the launch-config sweep: upstream defaults win. The lever
+     * for speed is on the kernel body, not the launch dispatcher.
+     */
+    __global__ void HEAVY_HASH_BOUNDS heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
         // assuming header_len is 72
         int nonceId = threadIdx.x + blockIdx.x*blockDim.x;
         if (nonceId < nonces_len) {
@@ -116,14 +182,40 @@ extern "C" {
                     break;
             }
             nonce = (nonce & nonce_mask) | nonce_fixed;
-            // header
-            uint8_t input[80];
-            memcpy(input, hash_header, HASH_HEADER_SIZE);
-            // data
-            // TODO: check endianity?
             uint256_t hash_;
-            memcpy(input +  HASH_HEADER_SIZE, (uint8_t *)(&nonce), 8);
-            hash(powP, hash_.hash, input);
+            /*
+             * First Keccak call (powP / pre-pow hash).
+             *
+             * Upstream materialised an 80-byte `uint8_t input[80]` in
+             * local memory and `memcpy`'d 72 bytes of header + 8 bytes
+             * of nonce into it before handing the pointer to `hash()`.
+             * That 80-byte stack buffer is a non-trivial register / spill
+             * cost (we're already at 126 regs/thread) and the memcpy
+             * adds 9 loads + 9 stores that the compiler can't always
+             * elide.
+             *
+             * The Keccak state itself only ever reads:
+             *   • bytes 0..71  from `hash_header`  (constant memory)
+             *   • bytes 72..79 from the 64-bit nonce
+             *   • bytes 80..   are zero (sponge padding)
+             * which lets us absorb the rate block directly with 9 XOR-
+             * with-constant + 1 XOR-with-nonce ops, plus a straight copy
+             * of the 15-u64 capacity tail from `powP`. No local buffer,
+             * no memcpy.
+             */
+            {
+                uint64_t a[25];
+                const uint64_t *hp = (const uint64_t *) hash_header;
+                const uint64_t *p  = (const uint64_t *) powP;
+                #pragma unroll
+                for (int i = 0; i < 9; i++) a[i] = p[i] ^ hp[i];
+                a[9] = p[9] ^ nonce;
+                #pragma unroll
+                for (int i = 10; i < 25; i++) a[i] = p[i];
+                P(a);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) ((uint64_t *) hash_.hash)[i] = a[i];
+            }
 
             //assert((rowId != 0) || (hashId != 0) );
             uchar4 packed_hash[QUARTER_MATRIX_SIZE] = {0};
@@ -145,6 +237,16 @@ extern "C" {
                 product1 >>= 6;
                 product1 &= 0xF0;
                 product2 >>= 10;
+                /*
+                 * On sm_120 the compiler-driven C path actually beats
+                 * an explicit lop3.b32 asm here — tried widening the
+                 * `__CUDA_ARCH__ < 500 || > 700` upstream gate to
+                 * sm_50+ and the rebuild measured 2.78 → 2.55 GH/s.
+                 * Hypothesis: the C variant works on u8 hash_.hash[rowId]
+                 * and nvcc lowers it to a byte-permute fused with the
+                 * `xor` step; lifting to u32 + lop3 + truncate forced an
+                 * extra promotion path. Kept upstream behaviour for now.
+                 */
                 #if __CUDA_ARCH__ < 500 || __CUDA_ARCH__ > 700
                 hash_.hash[rowId] = hash_.hash[rowId] ^ ((uint8_t)(product1) | (uint8_t)(product2));
                 #else
@@ -158,9 +260,33 @@ extern "C" {
              * satisfy the target — protocol compliance is enforced implicitly. */
             wave_mix(&hash_);
 
-            memset(input, 0, 80);
-            memcpy(input, hash_.hash, 32);
-            hash(heavyP, hash_.hash, input);
+            /*
+             * Second Keccak call (heavyP / final KeryxHash).
+             *
+             * Upstream zeroed the 80-byte `input[]` and memcpy'd 32 bytes
+             * of `hash_` over the front, then called `hash(heavyP, ...)`.
+             * Inside `hash()` the first 80 input bytes get XOR'd with
+             * the first 80 of `heavyP`. Bytes 32..79 are guaranteed
+             * zero, so 6 of the 10 input XORs are `x ^ 0 = x` — pure
+             * waste. Inline + skip:
+             *   • XOR 4 u64 of the matrix-product hash with heavyP[0..3]
+             *   • COPY 6 u64 of heavyP[4..9] (no XOR — input is zero)
+             *   • COPY 15 u64 of heavyP[10..24] (capacity tail)
+             * Saves: 80-byte memset, 32-byte memcpy, 6 XORs, and the
+             * call frame for `hash()`.
+             */
+            {
+                uint64_t a[25];
+                const uint64_t *hh = (const uint64_t *) hash_.hash;
+                const uint64_t *p  = (const uint64_t *) heavyP;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) a[i] = hh[i] ^ p[i];
+                #pragma unroll
+                for (int i = 4; i < 25; i++) a[i] = p[i];
+                P(a);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) ((uint64_t *) hash_.hash)[i] = a[i];
+            }
             if (LT_U256(hash_, target)){
                 atomicCAS((unsigned long long int*) final_nonce, 0, (unsigned long long int) nonce);
             }
