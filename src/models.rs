@@ -11,6 +11,8 @@ pub enum ModelFormat {
     Gguf,
     /// GGUF quantized — Qwen2 architecture (DeepSeek-R1-32B distill).
     GgufQwen2,
+    /// GGUF quantized — Qwen3 architecture (Qwen3-32B, 5090 tier).
+    GgufQwen3,
 }
 
 #[derive(Clone)]
@@ -104,7 +106,27 @@ pub const LLAMA_3_3_70B: ModelSpec = ModelSpec {
     min_vram_mb: 46_000,
 };
 
-pub const REGISTRY: &[&ModelSpec] = &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B, &LLAMA_3_3_70B];
+pub const QWEN3_32B: ModelSpec = ModelSpec {
+    name: "qwen3-32b",
+    // CIDv0[2..34] of model.gguf — Q6_K (bartowski, arch qwen3, candle-readable)
+    model_id: [
+        0xf0, 0x7e, 0x57, 0xb1, 0x1e, 0xd6, 0xcc, 0xe5,
+        0x63, 0x31, 0xae, 0xff, 0x60, 0xcf, 0xdb, 0x36,
+        0x24, 0xbd, 0x97, 0xe7, 0x03, 0x78, 0x8c, 0xba,
+        0x02, 0xce, 0x00, 0xfa, 0xe7, 0x9a, 0xb0, 0x43,
+    ],
+    format: ModelFormat::GgufQwen3,
+    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
+    config_cid: "",
+    weight_cids: &["QmeXSJ4bYmtnk9wVKUgb5S9GWTRqz15Tgya7gyqDbqv8Wn"],
+    dir_name: "Qwen3-32B",
+    // ~27 GB Q6_K weights + KV cache. Gated above 24 GB so it lands as the
+    // 5090-only tier (32 GB): excludes 24 GB cards, fits with KV headroom.
+    min_vram_mb: 30_000,
+};
+
+pub const REGISTRY: &[&ModelSpec] =
+    &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B, &QWEN3_32B, &LLAMA_3_3_70B];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().copied().find(|m| m.name == name)

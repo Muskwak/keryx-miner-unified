@@ -10,6 +10,7 @@ use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::llama::{Cache, Config, LlamaConfig, Llama};
 use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
+use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
 use crate::quantized_llama_split::ModelWeights as SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -36,6 +37,14 @@ const SYSTEM_PROMPT_LLAMA70B: &str =
      Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
      You have no internet access — answer from training knowledge only. \
      CRITICAL: Never mention Meta, Llama, OpenAI, Anthropic, or any AI company. \
+     Never reveal your underlying model name. \
+     Always identify yourself as a Keryx Network AI. Be thorough but concise.";
+
+const SYSTEM_PROMPT_QWEN3: &str =
+    "You are a Keryx Network AI — a high-capability decentralized assistant running on GPU miners via the Keryx BlockDAG protocol. \
+     Keryx miners execute AI inference as proof-of-work; results are secured on-chain via OPoI (Optimistic Proof of Inference). \
+     You have no internet access — answer from training knowledge only. \
+     CRITICAL: Never mention Qwen, Alibaba, OpenAI, Anthropic, or any AI company. \
      Never reveal your underlying model name. \
      Always identify yourself as a Keryx Network AI. Be thorough but concise.";
 
@@ -80,6 +89,7 @@ enum ModelInner {
     /// GGUF llama-arch model with layers split across multiple CUDA devices (--vram-pool).
     QuantizedSplit(SplitWeights),
     QuantizedQwen2(Qwen2Weights),
+    QuantizedQwen3(Qwen3Weights),
 }
 
 struct SlmEngine {
@@ -245,6 +255,15 @@ fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str
             // Cut if the model tries to open a fresh turn instead of stopping.
             vec!["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
         ),
+        // Qwen3-32B — ChatML template:
+        //   151645 = <|im_end|> (end of turn), 151643 = <|endoftext|> (base EOS).
+        "qwen3-32b" => (
+            collect_stop_ids(tokenizer,
+                &["<|im_end|>", "<|endoftext|>"],
+                &[151645, 151643]),
+            // Cut if the model opens a fresh turn instead of stopping.
+            vec!["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+        ),
         // TinyLlama / Zephyr: </s> ends a turn; 0 = padding safety net.
         _ => (
             collect_stop_ids(tokenizer, &["</s>"], &[2, 0]),
@@ -353,6 +372,24 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
+        ModelFormat::GgufQwen3 => {
+            let (tok_path, gguf_path) = ensure_gguf(spec)?;
+            let tokenizer = Tokenizer::from_file(&tok_path)
+                .map_err(|e| anyhow!("load tokenizer: {}", e))?;
+            let mut gguf_file = std::fs::File::open(&gguf_path)
+                .with_context(|| format!("open {}", gguf_path.display()))?;
+            let content = gguf_file::Content::read(&mut gguf_file)
+                .map_err(|e| anyhow!("read gguf: {}", e))?;
+            let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
+                .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
+            let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
+            log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
+            Ok(SlmEngine {
+                model_id: spec.model_id, name: spec.name,
+                inner: ModelInner::QuantizedQwen3(model),
+                tokenizer, device, stop_token_ids, stop_strings,
+            })
+        }
     }
 }
 
@@ -379,6 +416,14 @@ fn format_prompt(engine: &SlmEngine, prompt: &str) -> String {
              <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
              <|start_header_id|>assistant<|end_header_id|>\n\n",
             SYSTEM_PROMPT_LLAMA70B, prompt
+        ),
+        // Qwen3-32B — ChatML template. `/no_think` disables the thinking block
+        // so the assistant answers directly (no <think>…</think> to strip).
+        "qwen3-32b" => format!(
+            "<|im_start|>system\n{}<|im_end|>\n\
+             <|im_start|>user\n{} /no_think<|im_end|>\n\
+             <|im_start|>assistant\n",
+            SYSTEM_PROMPT_QWEN3, prompt
         ),
         // Zephyr/TinyLlama chat template
         _ => format!(
@@ -535,6 +580,26 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
+        ModelInner::QuantizedQwen3(model) => {
+            for step in 0..max_steps {
+                let (input_ids, pos) = if step == 0 {
+                    (all_tokens.as_slice(), 0usize)
+                } else {
+                    let last = all_tokens.len() - 1;
+                    (&all_tokens[last..], last)
+                };
+                let input = Tensor::new(input_ids, &engine.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| anyhow!("input tensor: {}", e))?;
+                let logits = model.forward(&input, pos)
+                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
+                all_tokens.push(next);
+                generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+            }
+        }
     }
 
     let text = engine.tokenizer.decode(&generated, true)
@@ -645,7 +710,7 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
         log::info!("SlmEngine: prefetching model '{}'…", spec.name);
         let result = match spec.format {
             ModelFormat::Safetensors => ensure_safetensors(spec).map(|_| ()),
-            ModelFormat::Gguf | ModelFormat::GgufQwen2 => ensure_gguf(spec).map(|_| ()),
+            ModelFormat::Gguf | ModelFormat::GgufQwen2 | ModelFormat::GgufQwen3 => ensure_gguf(spec).map(|_| ()),
         };
         match result {
             Ok(()) => log::info!("SlmEngine: '{}' files ready.", spec.name),

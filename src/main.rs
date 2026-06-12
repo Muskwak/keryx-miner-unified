@@ -446,11 +446,12 @@ async fn main() -> Result<(), Error> {
     check_gpu_power_limit(opt.high || opt.very_high, opt.very_high, opt.vram_pool);
 
     let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
-        info!("--very-high mode: loading all 4 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + LLaMA-70B).");
+        info!("--very-high mode: loading all 5 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + Qwen3-32B + LLaMA-70B).");
         &[
             &keryx_miner::models::TINYLLAMA,
             &keryx_miner::models::DEEPSEEK_R1_8B,
             &keryx_miner::models::DEEPSEEK_R1_32B,
+            &keryx_miner::models::QWEN3_32B,
             &keryx_miner::models::LLAMA_3_3_70B,
         ]
     } else if opt.high {
