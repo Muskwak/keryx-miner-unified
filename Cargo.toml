@@ -50,9 +50,9 @@ keryx-inference = { path = "inference" }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
 # Phase-3 OPoI: SLM inference via candle
-candle-core = { version = "0.8", features = ["cuda"] }
-candle-transformers = { version = "0.8", features = ["cuda"] }
-candle-nn = { version = "0.8", features = ["cuda"] }
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-transformers = { version = "0.9", features = ["cuda"] }
+candle-nn = { version = "0.9", features = ["cuda"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 ureq = { version = "2", features = ["tls"] }
 base64 = "0.22"

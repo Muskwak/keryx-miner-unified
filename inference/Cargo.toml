@@ -7,6 +7,6 @@ license = "ISC"
 description = "OPoI (Optimistic Proof of Inference) — synthetic MLP engine for Keryx miners"
 
 [dependencies]
-candle-core = { version = "0.8", default-features = false }
+candle-core = { version = "0.9", default-features = false }
 hex = { version = "0.4", features = ["serde"] }
 thiserror = "1.0"
