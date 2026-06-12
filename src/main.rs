@@ -127,7 +127,7 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 ///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
-fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: bool) {
+fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, needs_ultra: bool, vram_pool: bool) {
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=power.limit,power.max_limit,memory.total",
@@ -159,10 +159,10 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
         _ => return,
     };
 
-    // VRAM check for 70B: ~42.5 GB Q4_K_M weights + KV cache → requires a ≥46 GB card
+    // VRAM check for 70B (--ultra): ~42.5 GB Q4_K_M weights + KV cache → requires a ≥46 GB card
     // (48 GB single-GPU: RTX 6000 Ada / A6000 / L40S / RTX PRO 5000). A 32 GB card (RTX 5090)
     // OOMs on this quant, so it is gated out here.
-    if needs_very_high && vram_mb < 46_000 {
+    if needs_ultra && vram_mb < 46_000 {
         log::error!(
             "✗  LLaMA-3.3-70B (Q4_K_M) requires ≥46 GB VRAM (48 GB card: RTX 6000 Ada / A6000 / RTX PRO 5000, \
              or 2 GPUs pooled with --vram-pool) — only {} MB ({} GB) {}.",
@@ -171,13 +171,30 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, vram_pool: boo
             if vram_pool { "pooled across all GPUs" } else { "on this GPU" }
         );
         log::error!(
-            "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
+            "   Use --very-high (Qwen3-32B, fits in 32 GB) or --high (DeepSeek-R1-32B, fits in 24 GB)."
         );
         // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
     }
 
-    let model_label = if needs_very_high {
-        "LLaMA-3.3-70B (--very-high)"
+    // VRAM check for Qwen3-32B (--very-high): ~27 GB Q6_K weights + KV cache → requires a ≥30 GB card
+    // (RTX 5090 32 GB). A 24 GB card OOMs, so warn here (layer-A still drops it from the announce set).
+    if needs_very_high && vram_mb < 30_000 {
+        log::error!(
+            "✗  Qwen3-32B (Q6_K) requires ≥30 GB VRAM (RTX 5090 32 GB, or GPUs pooled with --vram-pool) \
+             — only {} MB ({} GB) {}.",
+            vram_mb,
+            vram_mb / 1024,
+            if vram_pool { "pooled across all GPUs" } else { "on this GPU" }
+        );
+        log::error!(
+            "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
+        );
+    }
+
+    let model_label = if needs_ultra {
+        "LLaMA-3.3-70B (--ultra)"
+    } else if needs_very_high {
+        "Qwen3-32B (--very-high)"
     } else if needs_high {
         "DeepSeek-R1-32B (--high)"
     } else {
@@ -443,16 +460,24 @@ async fn main() -> Result<(), Error> {
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(opt.high || opt.very_high, opt.very_high, opt.vram_pool);
+    check_gpu_power_limit(opt.high || opt.very_high || opt.ultra, opt.very_high, opt.ultra, opt.vram_pool);
 
-    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
-        info!("--very-high mode: loading all 5 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + Qwen3-32B + LLaMA-70B).");
+    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.ultra {
+        info!("--ultra mode: loading all 5 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + Qwen3-32B + LLaMA-70B).");
         &[
             &keryx_miner::models::TINYLLAMA,
             &keryx_miner::models::DEEPSEEK_R1_8B,
             &keryx_miner::models::DEEPSEEK_R1_32B,
             &keryx_miner::models::QWEN3_32B,
             &keryx_miner::models::LLAMA_3_3_70B,
+        ]
+    } else if opt.very_high {
+        info!("--very-high mode: loading TinyLlama + DeepSeek-8B + DeepSeek-32B + Qwen3-32B (5090 tier).");
+        &[
+            &keryx_miner::models::TINYLLAMA,
+            &keryx_miner::models::DEEPSEEK_R1_8B,
+            &keryx_miner::models::DEEPSEEK_R1_32B,
+            &keryx_miner::models::QWEN3_32B,
         ]
     } else if opt.high {
         info!("--high mode: loading TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B.");
