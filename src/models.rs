@@ -13,6 +13,10 @@ pub enum ModelFormat {
     GgufQwen2,
     /// GGUF quantized — Qwen3 architecture (Qwen3-32B, 5090 tier).
     GgufQwen3,
+    /// GGUF quantized — Qwen3-MoE architecture (Qwen3-235B-A22B, multi-GPU tier).
+    /// Served via the layer-split loader (`quantized_qwen3_moe_split`); fused
+    /// stacked experts pooled across the device list.
+    GgufQwen3Moe,
 }
 
 #[derive(Clone)]
@@ -125,8 +129,36 @@ pub const QWEN3_32B: ModelSpec = ModelSpec {
     min_vram_mb: 30_000,
 };
 
-pub const REGISTRY: &[&ModelSpec] =
-    &[&TINYLLAMA, &DEEPSEEK_R1_8B, &DEEPSEEK_R1_32B, &QWEN3_32B, &LLAMA_3_3_70B];
+pub const QWEN3_235B: ModelSpec = ModelSpec {
+    name: "qwen3-235b",
+    // TODO(release): set to CIDv0[2..34] of the pinned Q4_K_M model.gguf.
+    // Qwen3-235B-A22B (arch qwen3moe, Apache-2.0). PLACEHOLDER — must be the real
+    // weight CID before any build/announce, or the OPoI capability gate will
+    // advertise a model that cannot be fetched.
+    model_id: [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
+    format: ModelFormat::GgufQwen3Moe,
+    tokenizer_cid: "TODO_PIN_QWEN3_235B_TOKENIZER_CID",
+    config_cid: "",
+    weight_cids: &["TODO_PIN_QWEN3_235B_Q4KM_GGUF_CID"],
+    dir_name: "Qwen3-235B",
+    // ~135 GB Q4_K_M weights + KV cache. Gated so it only lands on rigs that can
+    // pool enough VRAM (e.g. 6×5090 = 192 GB). --very-ultra tier.
+    min_vram_mb: 140_000,
+};
+
+pub const REGISTRY: &[&ModelSpec] = &[
+    &TINYLLAMA,
+    &DEEPSEEK_R1_8B,
+    &DEEPSEEK_R1_32B,
+    &QWEN3_32B,
+    &QWEN3_235B,
+    &LLAMA_3_3_70B,
+];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
     REGISTRY.iter().copied().find(|m| m.name == name)
