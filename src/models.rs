@@ -131,20 +131,19 @@ pub const QWEN3_32B: ModelSpec = ModelSpec {
 
 pub const QWEN3_235B: ModelSpec = ModelSpec {
     name: "qwen3-235b",
-    // TODO(release): set to CIDv0[2..34] of the pinned Q4_K_M model.gguf.
-    // Qwen3-235B-A22B (arch qwen3moe, Apache-2.0). PLACEHOLDER — must be the real
-    // weight CID before any build/announce, or the OPoI capability gate will
-    // advertise a model that cannot be fetched.
+    // CIDv0[2..34] of the merged Q4_K_M model.gguf — Qwen3-235B-A22B (arch
+    // qwen3moe, Apache-2.0). Must match keryx-node params.rs QWEN3_235B_MODEL_ID.
     model_id: [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x6a, 0x2d, 0xa1, 0x7d, 0x05, 0x16, 0x65, 0x09,
+        0x08, 0x4e, 0x95, 0x1c, 0xe4, 0x1d, 0x8b, 0x77,
+        0xf1, 0x49, 0x63, 0xad, 0xab, 0x55, 0xe9, 0xd5,
+        0xa9, 0x85, 0x6c, 0x22, 0xa7, 0x99, 0x39, 0xf4,
     ],
     format: ModelFormat::GgufQwen3Moe,
-    tokenizer_cid: "TODO_PIN_QWEN3_235B_TOKENIZER_CID",
+    // Same Qwen3 tokenizer as Qwen3-32B (IPFS dedup → identical CID).
+    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
     config_cid: "",
-    weight_cids: &["TODO_PIN_QWEN3_235B_Q4KM_GGUF_CID"],
+    weight_cids: &["QmVV8HHdoVEz5bRY28eii3Mb3BunRYhcBwoC1PigdJ3tp3"],
     dir_name: "Qwen3-235B",
     // ~135 GB Q4_K_M weights + KV cache. Gated so it only lands on rigs that can
     // pool enough VRAM (e.g. 6×5090 = 192 GB). --very-ultra tier.
