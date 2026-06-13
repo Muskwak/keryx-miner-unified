@@ -127,7 +127,7 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 ///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
-fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, needs_ultra: bool, vram_pool: bool) {
+fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, needs_ultra: bool, needs_very_ultra: bool, vram_pool: bool) {
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=power.limit,power.max_limit,memory.total",
@@ -191,7 +191,25 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool, needs_ultra: b
         );
     }
 
-    let model_label = if needs_ultra {
+    // VRAM check for Qwen3-235B (--very-ultra): ~135 GB Q4_K_M weights + KV cache →
+    // requires a multi-GPU rig pooled with --vram-pool (e.g. 6×5090 = 192 GB). No
+    // single card fits it; layer-A also drops it from the announce set below 140 GB.
+    if needs_very_ultra && vram_mb < 140_000 {
+        log::error!(
+            "✗  Qwen3-235B-A22B (Q4_K_M) requires ~140 GB VRAM pooled across a multi-GPU rig \
+             (e.g. 6×5090 with --vram-pool) — only {} MB ({} GB) {}.",
+            vram_mb,
+            vram_mb / 1024,
+            if vram_pool { "pooled across all GPUs" } else { "on this GPU (add --vram-pool)" }
+        );
+        log::error!(
+            "   Add GPUs and pass --vram-pool, or use --ultra (LLaMA-3.3-70B) / a lower tier."
+        );
+    }
+
+    let model_label = if needs_very_ultra {
+        "Qwen3-235B-A22B (--very-ultra)"
+    } else if needs_ultra {
         "LLaMA-3.3-70B (--ultra)"
     } else if needs_very_high {
         "Qwen3-32B (--very-high)"
@@ -229,9 +247,9 @@ fn query_vram_mb() -> Option<(u64, u64)> {
 /// OPoI capability gate (layer A): drop the models this machine cannot actually
 /// serve, so the `ai:cap` announcement never promises a model the miner would
 /// fail to load — a 24 GB card running --very-high must announce 3 models, not 4.
-/// Pool-aware: with --vram-pool the summed VRAM only counts for llama-arch GGUF
-/// models (the only format the layer-split loader supports); every other format
-/// still has to fit on GPU 0. Skipped under --cpu-inference (no VRAM constraint)
+/// Pool-aware: with --vram-pool the summed VRAM counts for the split-loader
+/// formats (llama-arch GGUF and Qwen3-MoE GGUF); every other format still has to
+/// fit on GPU 0. Skipped under --cpu-inference (no VRAM constraint)
 /// and when nvidia-smi is unavailable (CPU-fallback setups keep working).
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
@@ -249,7 +267,12 @@ fn filter_specs_by_vram(
         .iter()
         .copied()
         .filter(|spec| {
-            let splittable = vram_pool && spec.format == keryx_miner::models::ModelFormat::Gguf;
+            let splittable = vram_pool
+                && matches!(
+                    spec.format,
+                    keryx_miner::models::ModelFormat::Gguf
+                        | keryx_miner::models::ModelFormat::GgufQwen3Moe
+                );
             let available = if splittable { pooled_mb } else { gpu0_mb };
             if spec.min_vram_mb <= available {
                 true
@@ -261,7 +284,11 @@ fn filter_specs_by_vram(
                     available,
                     if splittable { " pooled" } else { " on GPU 0" },
                     if !vram_pool && pooled_mb >= spec.min_vram_mb
-                        && spec.format == keryx_miner::models::ModelFormat::Gguf
+                        && matches!(
+                            spec.format,
+                            keryx_miner::models::ModelFormat::Gguf
+                                | keryx_miner::models::ModelFormat::GgufQwen3Moe
+                        )
                     {
                         " Your combined GPUs could serve it with --vram-pool."
                     } else {
@@ -460,9 +487,19 @@ async fn main() -> Result<(), Error> {
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
-    check_gpu_power_limit(opt.high || opt.very_high || opt.ultra, opt.very_high, opt.ultra, opt.vram_pool);
+    check_gpu_power_limit(opt.high || opt.very_high || opt.ultra || opt.very_ultra, opt.very_high, opt.ultra, opt.very_ultra, opt.vram_pool);
 
-    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.ultra {
+    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_ultra {
+        info!("--very-ultra mode: loading all 6 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + Qwen3-32B + LLaMA-70B + Qwen3-235B). Qwen3-235B requires --vram-pool across a multi-GPU rig.");
+        &[
+            &keryx_miner::models::TINYLLAMA,
+            &keryx_miner::models::DEEPSEEK_R1_8B,
+            &keryx_miner::models::DEEPSEEK_R1_32B,
+            &keryx_miner::models::QWEN3_32B,
+            &keryx_miner::models::LLAMA_3_3_70B,
+            &keryx_miner::models::QWEN3_235B,
+        ]
+    } else if opt.ultra {
         info!("--ultra mode: loading all 5 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + Qwen3-32B + LLaMA-70B).");
         &[
             &keryx_miner::models::TINYLLAMA,

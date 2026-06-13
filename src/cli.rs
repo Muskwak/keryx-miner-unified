@@ -4,7 +4,7 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      TinyLlama only — RTX 3060 6GB or any GPU\n  (default)    TinyLlama + DeepSeek-R1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  + Qwen3-32B — RTX 5090 (32GB)\n  --ultra      + LLaMA-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nModel tiers (default: TinyLlama + DeepSeek-8B — RTX 3060 12GB / 3070 / 3080):\n  --light      TinyLlama only — RTX 3060 6GB or any GPU\n  (default)    TinyLlama + DeepSeek-R1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)\n  --very-high  + Qwen3-32B — RTX 5090 (32GB)\n  --ultra      + LLaMA-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)\n  --very-ultra + Qwen3-235B-A22B — multi-GPU rig, ~140GB pooled VRAM (e.g. 6×5090) with --vram-pool", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
@@ -12,7 +12,7 @@ pub struct Opt {
         long = "light",
         help = "Model tier: TinyLlama only — any GPU (6GB+ VRAM)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["high", "very_high", "ultra"]
+        conflicts_with_all = &["high", "very_high", "ultra", "very_ultra"]
     )]
     pub light: bool,
 
@@ -20,7 +20,7 @@ pub struct Opt {
         long = "high",
         help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B — RTX 3090 / 4090 (24GB+)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "very_high", "ultra"]
+        conflicts_with_all = &["light", "very_high", "ultra", "very_ultra"]
     )]
     pub high: bool,
 
@@ -28,7 +28,7 @@ pub struct Opt {
         long = "very-high",
         help = "Model tier: TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B + Qwen3-32B — RTX 5090 (32GB)",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high", "ultra"]
+        conflicts_with_all = &["light", "high", "ultra", "very_ultra"]
     )]
     pub very_high: bool,
 
@@ -39,6 +39,14 @@ pub struct Opt {
         conflicts_with_all = &["light", "high", "very_high"]
     )]
     pub ultra: bool,
+
+    #[clap(
+        long = "very-ultra",
+        help = "Model tier: all models incl. Qwen3-235B-A22B (MoE) — multi-GPU rig, ~140GB pooled VRAM (e.g. 6×5090). Use with --vram-pool.",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["light", "high", "very_high", "ultra"]
+    )]
+    pub very_ultra: bool,
 
     #[clap(
         long = "cpu-inference",
