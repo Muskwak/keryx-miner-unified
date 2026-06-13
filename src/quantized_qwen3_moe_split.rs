@@ -255,9 +255,12 @@ impl ModelWeights {
             .and_then(|v| v.to_u32())
             .unwrap_or(0);
         let norm_topk_prob = shared_ff == 0;
-        // MoE compute dtype: F32 to match the rest of this split's F32 pipeline
-        // (deterministic across GPU archs — required for OPoI reproducibility).
-        let moe_dtype = DType::F32;
+        // MoE compute dtype: candle's fused MoE GEMM (moe_gemm_gguf) only supports
+        // BF16/F16, not F32. The hidden state stays F32 in the rest of this split;
+        // FusedMoeGGUF converts in (F32→BF16) and back (BF16→F32) internally, so
+        // only the expert GEMM runs in BF16. (Cross-arch BF16 determinism is the
+        // open OPoI question for this tier — gated behind opoi_v2 until resolved.)
+        let moe_dtype = DType::BF16;
 
         // RoPE tables and -inf constants are tiny; build one copy per device.
         let mut cos_sin = Vec::with_capacity(devices.len());
