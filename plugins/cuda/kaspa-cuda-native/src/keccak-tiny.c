@@ -36,6 +36,39 @@ __device__ static const uint64_t RC[24] = \
 
 /*** Helper macros to unroll the permutation. ***/
 #define rol(x, s) (((x) << s) | ((x) >> (64 - s)))
+
+/* Register-resident 3-input bitwise primitives for theta/chi.
+ * On device each 64-bit op lowers to two lop3.b32 (one per 32-bit half):
+ *   eor3(a,b,c) = a ^ b ^ c                 (LUT 0x96) — theta column mix
+ *   bcax(a,b,c) = a ^ (~b & c)              (LUT 0xD2) — chi step
+ * Bit-exact with the reference expressions (verified on RTX 3090, sm_86);
+ * the host fallback below keeps non-device compilation passes valid. */
+__device__ static __forceinline__ uint64_t eor3(uint64_t a, uint64_t b, uint64_t c) {
+#if defined(__CUDA_ARCH__)
+  uint32_t al = (uint32_t)a, ah = (uint32_t)(a >> 32);
+  uint32_t bl = (uint32_t)b, bh = (uint32_t)(b >> 32);
+  uint32_t cl = (uint32_t)c, ch = (uint32_t)(c >> 32);
+  uint32_t rl, rh;
+  asm("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(rl) : "r"(al), "r"(bl), "r"(cl));
+  asm("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(rh) : "r"(ah), "r"(bh), "r"(ch));
+  return ((uint64_t)rh << 32) | rl;
+#else
+  return a ^ b ^ c;
+#endif
+}
+__device__ static __forceinline__ uint64_t bcax(uint64_t a, uint64_t b, uint64_t c) {
+#if defined(__CUDA_ARCH__)
+  uint32_t al = (uint32_t)a, ah = (uint32_t)(a >> 32);
+  uint32_t bl = (uint32_t)b, bh = (uint32_t)(b >> 32);
+  uint32_t cl = (uint32_t)c, ch = (uint32_t)(c >> 32);
+  uint32_t rl, rh;
+  asm("lop3.b32 %0, %1, %2, %3, 0xD2;" : "=r"(rl) : "r"(al), "r"(bl), "r"(cl));
+  asm("lop3.b32 %0, %1, %2, %3, 0xD2;" : "=r"(rh) : "r"(ah), "r"(bh), "r"(ch));
+  return ((uint64_t)rh << 32) | rl;
+#else
+  return a ^ (~b & c);
+#endif
+}
 #define REPEAT6(e) e e e e e e
 #define REPEAT24(e) REPEAT6(e e e e)
 #define REPEAT5(e) e e e e e
@@ -59,7 +92,7 @@ __device__ static inline void keccakf(void* state) {
               b[x] ^= a[x + y]; ))
     FOR5(x, 1,
          FOR5(y, 5,
-              a[y + x] ^= b[(x + 4) % 5] ^ rol(b[(x + 1) % 5], 1); ))
+              a[y + x] = eor3(a[y + x], b[(x + 4) % 5], rol(b[(x + 1) % 5], 1)); ))
     // Rho and pi
     t = a[1];
     x = 0;
@@ -73,7 +106,7 @@ __device__ static inline void keccakf(void* state) {
        FOR5(x, 1,
             b[x] = a[y + x];)
        FOR5(x, 1,
-            a[y + x] = b[x] ^ ((~b[(x + 1) % 5]) & b[(x + 2) % 5]); ))
+            a[y + x] = bcax(b[x], b[(x + 1) % 5], b[(x + 2) % 5]); ))
     // Iota
     a[0] ^= RC[i];
   }
