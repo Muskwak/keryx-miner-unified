@@ -83,6 +83,12 @@ pub struct KeryxdHandler {
 
     /// Auto-claim module: present when an escrow private key is available.
     escrow_watcher: Option<crate::escrow::EscrowWatcher>,
+
+    /// Last synthetic-liveness epoch for which we queued a task. We enqueue exactly
+    /// one synthetic AiRequest per epoch (Level-1 OPoI: proves this miner is online
+    /// and serving a model it declared, or its blocks get rejected once the gate is
+    /// live). `None` until the first task is queued.
+    last_synthetic_epoch: Option<u64>,
 }
 
 #[async_trait(?Send)]
@@ -203,6 +209,7 @@ impl KeryxdHandler {
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
+            last_synthetic_epoch: None,
         }))
     }
 
@@ -302,6 +309,49 @@ impl KeryxdHandler {
     /// Handles two formats:
     ///   - Subnetwork 0x03 + binary `AiRequestPayload` (future on-chain format)
     ///   - Any non-coinbase TX + `KRX:AI:1:` JSON prefix (web wallet format)
+    /// Level-1 OPoI synthetic liveness: once per epoch, queue a protocol-derived
+    /// synthetic AiRequest for one of our loaded models. Answering it on-chain (via
+    /// the normal inference → AiResponse path) proves to consensus that this miner
+    /// is online and actually serving a model it declared, otherwise its blocks are
+    /// rejected once `synthetic_liveness_activation` is live. The task is derived
+    /// from our escrow pubkey (the coinbase `/escrow:` identity) + the epoch, so the
+    /// node attributes the answer to us when it lands in one of our own blocks.
+    fn maybe_enqueue_synthetic_task(&mut self) {
+        if self.last_known_daa == 0 {
+            return; // no DAA seen yet
+        }
+        let epoch = self.last_known_daa / keryx_inference::synthetic::SYNTHETIC_EPOCH_BLOCKS;
+        if self.last_synthetic_epoch == Some(epoch) {
+            return; // already queued this epoch
+        }
+        // Need our escrow identity and at least one ready model to answer.
+        let Some(pubkey_hex) = self.escrow_pubkey.as_ref() else { return };
+        let mut pubkey = [0u8; 32];
+        if hex::decode_to_slice(pubkey_hex, &mut pubkey).is_err() {
+            return;
+        }
+        let ready_ids = keryx_miner::slm::loaded_model_ids();
+        if ready_ids.is_empty() {
+            return; // no inference capability (mining itself is gated elsewhere)
+        }
+        let seed = keryx_inference::synthetic::synthetic_seed(epoch, &pubkey);
+        let Some(req) = keryx_inference::synthetic::derive_synthetic_request(&seed, &ready_ids, epoch) else {
+            return;
+        };
+        let raw = req.serialize();
+        let model_id = req.model_id;
+        let prompt = String::from_utf8_lossy(&req.prompt).into_owned();
+        let max_tokens = req.max_tokens as usize;
+        let stable_id = hex::encode(&blake2b_simd::blake2b(&raw).as_bytes()[..8]);
+
+        // Mark the epoch handled even if dedup drops it, so we don't retry every template.
+        self.last_synthetic_epoch = Some(epoch);
+        if self.ai_seen_prefixes.insert(stable_id.clone()) {
+            info!("OPoI: queued synthetic liveness task epoch={} id={}", epoch, stable_id);
+            self.ai_request_queue.push_back((stable_id, raw, model_id, prompt, max_tokens));
+        }
+    }
+
     fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction]) {
         // Hard gate: if no models are ready, refuse to accept any AiRequest.
         // Prevents miners with missing/truncated model files from ever queuing inference work.
@@ -587,6 +637,8 @@ impl KeryxdHandler {
                         self.last_known_daa = daa;
                     }
                 }
+                // Level-1 OPoI: once per epoch, queue our synthetic liveness task.
+                self.maybe_enqueue_synthetic_task();
                 // Handle node-issued inference challenge: spawn an inference task if a new
                 // challenge arrived and no challenge is already in flight.
                 if !template.inference_challenge.is_empty() && self.challenge_inference_rx.is_none() {

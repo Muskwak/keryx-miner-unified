@@ -1615,6 +1615,7 @@ dependencies = [
 name = "keryx-inference"
 version = "1.1.1"
 dependencies = [
+ "blake2b_simd",
  "candle-core",
  "hex",
  "thiserror 1.0.69",
