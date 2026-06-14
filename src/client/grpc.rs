@@ -89,6 +89,16 @@ pub struct KeryxdHandler {
     /// and serving a model it declared, or its blocks get rejected once the gate is
     /// live). `None` until the first task is queued.
     last_synthetic_epoch: Option<u64>,
+
+    /// The synthetic answer we are waiting to see land in one of our own blocks:
+    /// `(epoch, request_hash)`. Set when we queue the epoch's task.
+    current_answer: Option<(u64, [u8; 32])>,
+
+    /// Most recent of OUR OWN blocks that carried a synthetic answer: `(block_hash_hex,
+    /// epoch)`. Once set, we embed `/live:<hash>` in the coinbase extra_data so the
+    /// node accepts our later blocks (which can't re-include the one-per-epoch answer
+    /// tx) by following the reference to this annotated ancestor.
+    live_anchor: Option<(String, u64)>,
 }
 
 #[async_trait(?Send)]
@@ -210,6 +220,8 @@ impl KeryxdHandler {
             escrow_pubkey,
             escrow_watcher,
             last_synthetic_epoch: None,
+            current_answer: None,
+            live_anchor: None,
         }))
     }
 
@@ -263,7 +275,13 @@ impl KeryxdHandler {
                 format!("/ai:cap:{}", hex_ids.join(","))
             }
         };
-        let extra_data = format!("{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part);
+        // OPoI Level-1 liveness: reference our latest own block that carried a synthetic
+        // answer, so blocks that can't re-include the one-per-epoch answer tx stay valid.
+        let live_part = self.live_anchor
+            .as_ref()
+            .map(|(hash, _)| format!("/live:{}", hash))
+            .unwrap_or_default();
+        let extra_data = format!("{}{}/{}/ai:v1:{}{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part, live_part);
         // Harvest a pending challenge response if the inference task just finished.
         let inference_result = match self.challenge_inference_rx.take() {
             Some((challenge_str, mut rx)) => match rx.try_recv() {
@@ -342,7 +360,13 @@ impl KeryxdHandler {
         let model_id = req.model_id;
         let prompt = String::from_utf8_lossy(&req.prompt).into_owned();
         let max_tokens = req.max_tokens as usize;
-        let stable_id = hex::encode(&blake2b_simd::blake2b(&raw).as_bytes()[..8]);
+        let full_hash = blake2b_simd::blake2b(&raw);
+        let stable_id = hex::encode(&full_hash.as_bytes()[..8]);
+        // Remember this epoch's request_hash so we can recognise our answer landing in
+        // one of our own blocks and set it as the /live: anchor (matches poll_inference).
+        let mut request_hash = [0u8; 32];
+        request_hash.copy_from_slice(&full_hash.as_bytes()[..32]);
+        self.current_answer = Some((epoch, request_hash));
 
         // Mark the epoch handled even if dedup drops it, so we don't retry every template.
         self.last_synthetic_epoch = Some(epoch);
@@ -350,6 +374,42 @@ impl KeryxdHandler {
             info!("OPoI: queued synthetic liveness task epoch={} id={}", epoch, stable_id);
             self.ai_request_queue.push_back((stable_id, raw, model_id, prompt, max_tokens));
         }
+    }
+
+    /// Detects when our current-epoch synthetic answer has landed in one of OUR OWN
+    /// blocks (coinbase `/escrow:` == our pubkey) and records that block as the `/live:`
+    /// anchor. Subsequent blocks reference it so they stay liveness-valid without
+    /// re-including the (already-accepted) one-per-epoch answer tx.
+    fn update_live_anchor(&mut self, block: &crate::proto::RpcBlock) {
+        let Some((epoch, req_hash)) = self.current_answer else { return };
+        // Already anchored this epoch (or a newer one)? nothing to do.
+        if self.live_anchor.as_ref().is_some_and(|(_, e)| *e >= epoch) {
+            return;
+        }
+        let Some(pk) = self.escrow_pubkey.clone() else { return };
+        let Some(coinbase) = block.transactions.first() else { return };
+        // Is this our block? The coinbase extra_data must carry /escrow:<our pubkey>.
+        let Some(cb_bytes) = hex::decode(&coinbase.payload).ok() else { return };
+        if !String::from_utf8_lossy(&cb_bytes).contains(&format!("/escrow:{}", pk)) {
+            return;
+        }
+        // Does it carry our synthetic answer (the request_hash we just submitted)?
+        let carries_answer = block.transactions.iter().skip(1).any(|tx| {
+            tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX
+                && hex::decode(&tx.payload)
+                    .ok()
+                    .and_then(|b| keryx_inference::AiResponsePayload::deserialize(&b))
+                    .is_some_and(|r| r.request_hash == req_hash)
+        });
+        if !carries_answer {
+            return;
+        }
+        let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
+        if hash.is_empty() {
+            return;
+        }
+        info!("OPoI: /live: anchor set to our block {} (epoch {})", &hash[..16.min(hash.len())], epoch);
+        self.live_anchor = Some((hash, epoch));
     }
 
     fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction]) {
@@ -603,6 +663,7 @@ impl KeryxdHandler {
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
                         self.scan_txs_for_ai_requests(&block.transactions.clone());
+                        self.update_live_anchor(&block);
                         self.try_start_inference();
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
@@ -715,6 +776,7 @@ impl KeryxdHandler {
                     warn!("GetBlockResponse error: {}", e.message);
                 } else if let Some(block) = msg.block {
                     self.scan_txs_for_ai_requests(&block.transactions.clone());
+                    self.update_live_anchor(&block);
                     self.try_start_inference();
                     let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                     if let Some(tx) = claim_tx {
