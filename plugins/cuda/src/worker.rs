@@ -15,6 +15,7 @@ static BPS: f32 = 1.;
 
 static PTX_120: &str = include_str!("../resources/keryx-cuda-sm120.ptx");
 static PTX_100: &str = include_str!("../resources/keryx-cuda-sm100.ptx");
+static PTX_90: &str = include_str!("../resources/keryx-cuda-sm90.ptx");
 static PTX_89: &str = include_str!("../resources/keryx-cuda-sm89.ptx");
 static PTX_86: &str = include_str!("../resources/keryx-cuda-sm86.ptx");
 static PTX_80: &str = include_str!("../resources/keryx-cuda-sm80.ptx");
@@ -208,7 +209,24 @@ impl<'gpu> CudaGPUWorker<'gpu> {
                     load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?
                 }
             });
-        } else if major == 9 || (major == 8 && minor >= 9) {
+        } else if major == 9 {
+            // sm_90 (Hopper — H100 / H200 / GH200). Routed here before the Ada branch so it
+            // loads the native sm_90 PTX instead of JIT'ing the sm_89 build. Falls back to
+            // sm_89 then sm_86 if the driver is too old for the sm_90 PTX ISA.
+            _module = Arc::new(match load_ptx(PTX_90, "sm_90") {
+                Ok(m) => {
+                    info!("GPU #{} using optimised sm_90 PTX", device_id);
+                    m
+                }
+                Err(e) => {
+                    info!("GPU #{} sm_90 PTX failed; trying sm_89 then sm_86 fallback", device_id);
+                    match load_ptx(PTX_89, "sm_89") {
+                        Ok(m) => m,
+                        Err(_) => load_ptx(PTX_86, "sm_86 (fallback)").map_err(|_| e)?,
+                    }
+                }
+            });
+        } else if major == 8 && minor >= 9 {
             // sm_89 (RTX 40 / Ada Lovelace)
             _module = Arc::new(match load_ptx(PTX_89, "sm_89") {
                 Ok(m) => {
