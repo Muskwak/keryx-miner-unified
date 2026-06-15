@@ -88,3 +88,10 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 [workspace]
 members = ["inference", "plugins/*"]
 default-members = [".", "plugins/cuda", "plugins/opencl"]
+
+# Vendored candle-kernels: the upstream MoE bf16 WMMA kernels only compile for
+# sm_80+, which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
+# inference. The vendored copy guards those kernel bodies with `#if __CUDA_ARCH__
+# >= 800` so the crate builds at sm_75 (stub on older archs, real MoE on sm_80+).
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }
