@@ -271,6 +271,8 @@ fn filter_specs_by_vram(
                 && matches!(
                     spec.format,
                     keryx_miner::models::ModelFormat::Gguf
+                        | keryx_miner::models::ModelFormat::GgufQwen2
+                        | keryx_miner::models::ModelFormat::GgufQwen3
                         | keryx_miner::models::ModelFormat::GgufQwen3Moe
                 );
             let available = if splittable { pooled_mb } else { gpu0_mb };
@@ -287,6 +289,8 @@ fn filter_specs_by_vram(
                         && matches!(
                             spec.format,
                             keryx_miner::models::ModelFormat::Gguf
+                                | keryx_miner::models::ModelFormat::GgufQwen2
+                                | keryx_miner::models::ModelFormat::GgufQwen3
                                 | keryx_miner::models::ModelFormat::GgufQwen3Moe
                         )
                     {

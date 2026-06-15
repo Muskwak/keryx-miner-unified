@@ -12,7 +12,9 @@ use candle_transformers::models::quantized_llama::ModelWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Weights;
 use crate::quantized_llama_split::ModelWeights as SplitWeights;
+use crate::quantized_qwen2_split::ModelWeights as Qwen2SplitWeights;
 use crate::quantized_qwen3_moe_split::ModelWeights as Qwen3MoeSplitWeights;
+use crate::quantized_qwen3_split::ModelWeights as Qwen3SplitWeights;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
@@ -90,7 +92,11 @@ enum ModelInner {
     /// GGUF llama-arch model with layers split across multiple CUDA devices (--vram-pool).
     QuantizedSplit(SplitWeights),
     QuantizedQwen2(Qwen2Weights),
+    /// GGUF Qwen2-arch model (DeepSeek-R1-32B) with layers split across CUDA devices (--vram-pool).
+    QuantizedQwen2Split(Qwen2SplitWeights),
     QuantizedQwen3(Qwen3Weights),
+    /// GGUF Qwen3-arch dense model (Qwen3-32B) with layers split across CUDA devices (--vram-pool).
+    QuantizedQwen3Split(Qwen3SplitWeights),
     /// GGUF Qwen3-MoE model (Qwen3-235B), layers + stacked experts split across
     /// CUDA devices (--vram-pool). Always loaded via the split loader.
     QuantizedQwen3MoeSplit(Qwen3MoeSplitWeights),
@@ -366,13 +372,37 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
-                .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
+            // --vram-pool: split layers across every CUDA device (e.g. DeepSeek-R1-32B
+            // served by a rig of 8 GB cards). Falls back to single-device otherwise.
+            let inner = if vram_pool_enabled() && device.is_cuda() {
+                let devices = cuda_pool_devices(&device);
+                if devices.len() >= 2 {
+                    log::info!(
+                        "SlmEngine: --vram-pool — splitting '{}' (Qwen2) layers evenly across {} GPUs",
+                        spec.name,
+                        devices.len()
+                    );
+                    let model = Qwen2SplitWeights::from_gguf(content, &mut gguf_file, &devices)
+                        .map_err(|e| anyhow!("load qwen2 gguf weights (split): {}", e))?;
+                    ModelInner::QuantizedQwen2Split(model)
+                } else {
+                    log::warn!(
+                        "SlmEngine: --vram-pool set but only one CUDA device found — single-GPU load"
+                    );
+                    let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
+                        .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
+                    ModelInner::QuantizedQwen2(model)
+                }
+            } else {
+                let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
+                    .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
+                ModelInner::QuantizedQwen2(model)
+            };
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
-                inner: ModelInner::QuantizedQwen2(model),
+                inner,
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
@@ -384,13 +414,37 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .with_context(|| format!("open {}", gguf_path.display()))?;
             let content = gguf_file::Content::read(&mut gguf_file)
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
-            let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
-                .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
+            // --vram-pool: split layers across every CUDA device (Qwen3-32B served by
+            // a multi-GPU rig). Falls back to single-device otherwise.
+            let inner = if vram_pool_enabled() && device.is_cuda() {
+                let devices = cuda_pool_devices(&device);
+                if devices.len() >= 2 {
+                    log::info!(
+                        "SlmEngine: --vram-pool — splitting '{}' (Qwen3) layers evenly across {} GPUs",
+                        spec.name,
+                        devices.len()
+                    );
+                    let model = Qwen3SplitWeights::from_gguf(content, &mut gguf_file, &devices)
+                        .map_err(|e| anyhow!("load qwen3 gguf weights (split): {}", e))?;
+                    ModelInner::QuantizedQwen3Split(model)
+                } else {
+                    log::warn!(
+                        "SlmEngine: --vram-pool set but only one CUDA device found — single-GPU load"
+                    );
+                    let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
+                        .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
+                    ModelInner::QuantizedQwen3(model)
+                }
+            } else {
+                let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
+                    .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
+                ModelInner::QuantizedQwen3(model)
+            };
             let (stop_token_ids, stop_strings) = stop_config(&tokenizer, spec.name);
             log::info!("SlmEngine: '{}' ready (stops={:?})", spec.name, stop_token_ids);
             Ok(SlmEngine {
                 model_id: spec.model_id, name: spec.name,
-                inner: ModelInner::QuantizedQwen3(model),
+                inner,
                 tokenizer, device, stop_token_ids, stop_strings,
             })
         }
@@ -615,7 +669,47 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
                 if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
             }
         }
+        ModelInner::QuantizedQwen2Split(model) => {
+            for step in 0..max_steps {
+                let (input_ids, pos) = if step == 0 {
+                    (all_tokens.as_slice(), 0usize)
+                } else {
+                    let last = all_tokens.len() - 1;
+                    (&all_tokens[last..], last)
+                };
+                let input = Tensor::new(input_ids, &engine.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| anyhow!("input tensor: {}", e))?;
+                let logits = model.forward(&input, pos)
+                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
+                all_tokens.push(next);
+                generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+            }
+        }
         ModelInner::QuantizedQwen3(model) => {
+            for step in 0..max_steps {
+                let (input_ids, pos) = if step == 0 {
+                    (all_tokens.as_slice(), 0usize)
+                } else {
+                    let last = all_tokens.len() - 1;
+                    (&all_tokens[last..], last)
+                };
+                let input = Tensor::new(input_ids, &engine.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| anyhow!("input tensor: {}", e))?;
+                let logits = model.forward(&input, pos)
+                    .map_err(|e| anyhow!("forward: {}", e))?;
+                let next = sample_next(&logits, &mut lp, &all_tokens)?;
+                if engine.stop_token_ids.contains(&next) { break; }
+                all_tokens.push(next);
+                generated.push(next);
+                if hit_stop_string(&engine.tokenizer, &generated, &engine.stop_strings) { break; }
+            }
+        }
+        ModelInner::QuantizedQwen3Split(model) => {
             for step in 0..max_steps {
                 let (input_ids, pos) = if step == 0 {
                     (all_tokens.as_slice(), 0usize)
