@@ -355,16 +355,14 @@ impl KeryxdHandler {
         if ready_ids.is_empty() {
             return; // no inference capability (mining itself is gated elsewhere)
         }
-        // Answer with the model already resident in VRAM so the synthetic task never
-        // forces an eviction/reload (the node validates the response against whatever
-        // model_id it carries — any served model is accepted). Only fall back to the
-        // protocol pick over downloaded models when nothing is resident yet (startup).
-        let answer_ids: Vec<[u8; 32]> = match keryx_miner::slm::resident_model_id() {
-            Some(m) if ready_ids.contains(&m) => vec![m],
-            _ => ready_ids,
-        };
+        // Pick a (per-epoch, pseudo-random) declared model so liveness rotates across
+        // everything we declared. The node accepts whatever model_id the response carries.
+        // The capability challenge is deferred at connect, so at startup this synthetic is
+        // the single inference that loads the first model. An occasional reload (when the
+        // pick differs from the resident model) is acceptable — often it lands on a light
+        // model anyway.
         let seed = keryx_inference::synthetic::synthetic_seed(epoch, &pubkey);
-        let Some(req) = keryx_inference::synthetic::derive_synthetic_request(&seed, &answer_ids, epoch) else {
+        let Some(req) = keryx_inference::synthetic::derive_synthetic_request(&seed, &ready_ids, epoch) else {
             return;
         };
         let raw = req.serialize();
