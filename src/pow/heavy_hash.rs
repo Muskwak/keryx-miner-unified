@@ -9,6 +9,7 @@ use std::mem::MaybeUninit;
 const KERYX_MATRIX_SALT_V1: [u8; 32] = *b"KERYX:KeryxHash-v1:2026-04-12:xx";
 const KERYX_MATRIX_SALT_V2: [u8; 32] = *b"KERYX:KeryxHash-v2:2026-05-29:xx";
 const KERYX_MATRIX_SALT_V4: [u8; 32] = *b"KERYX:KeryxHash-v4:2026-06-07:xx";
+const KERYX_MATRIX_SALT_V5: [u8; 32] = *b"KERYX:KeryxHash-v5:2026-06-16:xx";
 
 /// DAA score at which the miner switches to SALT v2 — must match `pow_salt_v2_activation`
 /// in network params. Miners compiled before this update will keep using v1 and their
@@ -28,11 +29,22 @@ pub const POW_SALT_V2_ACTIVATION_DAA: u64 = 0;
 /// TESTNET BUILD — revert to 21_932_751 before any mainnet build.
 pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 0;
 
-/// Returns the active matrix-salt version (1, 2 or 4) for a block at `daa_score`.
+/// DAA score at which the miner switches to SALT v5 — must match `pow_salt_v5_activation`
+/// in network params. Shipped at the same DAA as `opoi_v2` to force a clean fleet upgrade
+/// at the hardfork. Matrix is host-side, so no kernel/PTX change is needed.
+///
+/// Mainnet: u64::MAX (never — set to the opoi_v2 H DAA before any mainnet build)
+/// Testnet: 1_000 (same DAA as opoi_v2 testnet; cutover observable on a fresh chain)
+/// TESTNET BUILD — set to the chosen mainnet H before any mainnet build.
+pub const POW_SALT_V5_ACTIVATION_DAA: u64 = 1_000;
+
+/// Returns the active matrix-salt version (1, 2, 4 or 5) for a block at `daa_score`.
 /// Must mirror `active_salt_version` in `consensus/pow/src/lib.rs` (compared with `>=`).
 #[inline(always)]
 pub fn active_salt_version(daa_score: u64) -> u8 {
-    if daa_score >= POW_SALT_V4_ACTIVATION_DAA {
+    if daa_score >= POW_SALT_V5_ACTIVATION_DAA {
+        5
+    } else if daa_score >= POW_SALT_V4_ACTIVATION_DAA {
         4
     } else if daa_score >= POW_SALT_V2_ACTIVATION_DAA {
         2
@@ -87,6 +99,7 @@ impl Matrix {
         let salt: &[u8; 32] = match salt_version {
             1 => &KERYX_MATRIX_SALT_V1,
             2 => &KERYX_MATRIX_SALT_V2,
+            5 => &KERYX_MATRIX_SALT_V5,
             _ => &KERYX_MATRIX_SALT_V4,
         };
         let salted = {
