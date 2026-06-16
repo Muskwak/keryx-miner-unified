@@ -92,10 +92,6 @@ pub struct KeryxdHandler {
     /// and serving a model it declared, or its blocks get rejected once the gate is
     /// live). `None` until the first task is queued.
     last_synthetic_epoch: Option<u64>,
-    /// Whether the last synthetic answer was produced in the opoi_v2 era. A v1 answer made
-    /// before the opoi_v2 hardfork does NOT satisfy v2 enforcement, so when opoi_v2 activates
-    /// mid-epoch we must re-answer the current epoch in v2 even though it was already answered.
-    last_synthetic_v2: bool,
 
     /// The synthetic answer we are waiting to see land in one of our own blocks:
     /// `(epoch, request_hash)`. Set when we queue the epoch's task.
@@ -227,7 +223,6 @@ impl KeryxdHandler {
             escrow_pubkey,
             escrow_watcher,
             last_synthetic_epoch: None,
-            last_synthetic_v2: false,
             current_answer: None,
             live_anchor: None,
         }))
@@ -347,14 +342,8 @@ impl KeryxdHandler {
             return; // no DAA seen yet
         }
         let epoch = self.last_known_daa / keryx_inference::synthetic::SYNTHETIC_EPOCH_BLOCKS;
-        // opoi_v2 changes the AiResponse format (v1 → v2). A v1 answer made before the
-        // hardfork does NOT satisfy v2 synthetic-liveness enforcement, so when opoi_v2
-        // activates mid-epoch we must re-answer the current epoch in v2 — even though it
-        // was already answered in v1. Skip only if we've answered this epoch in the
-        // currently-required era.
-        let opoi_v2_active = self.last_known_daa >= OPOI_V2_ACTIVATION_DAA;
-        if self.last_synthetic_epoch == Some(epoch) && (self.last_synthetic_v2 || !opoi_v2_active) {
-            return; // already answered this epoch in the current (v1/v2) era
+        if self.last_synthetic_epoch == Some(epoch) {
+            return; // already queued this epoch
         }
         // Need our escrow identity and at least one ready model to answer.
         let Some(pubkey_hex) = self.escrow_pubkey.as_ref() else { return };
@@ -397,7 +386,6 @@ impl KeryxdHandler {
 
         // Mark the epoch handled even if dedup drops it, so we don't retry every template.
         self.last_synthetic_epoch = Some(epoch);
-        self.last_synthetic_v2 = opoi_v2_active;
         if self.ai_seen_prefixes.insert(stable_id.clone()) {
             info!("OPoI: queued synthetic liveness task epoch={} id={}", epoch, stable_id);
             self.ai_request_queue.push_back((stable_id, raw, model_id, prompt, max_tokens));
