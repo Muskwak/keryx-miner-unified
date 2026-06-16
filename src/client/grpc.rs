@@ -26,8 +26,11 @@ type BlockHandle = JoinHandle<Result<(), PollSendError<KaspadMessage>>>;
 
 /// OPoI v2 hardfork activation DAA — MUST match `opoi_v2_activation` in keryx-node params.rs.
 /// From this score AiResponse txs use the 142-byte v2 payload (model_id + result_commitment).
-/// TODO(hardfork): set to the concrete H before the v0.4.0 release.
-pub const OPOI_V2_ACTIVATION_DAA: u64 = u64::MAX;
+/// Must match `opoi_v2_activation` in network params, or the miner keeps publishing
+/// v1 AiResponses that consensus can't match as v2 synthetic-liveness answers.
+/// Testnet: 1_000 (== TESTNET_PARAMS opoi_v2_activation).
+/// TESTNET BUILD — set to the concrete mainnet H before the v0.4.0 release.
+pub const OPOI_V2_ACTIVATION_DAA: u64 = 1_000;
 
 /// Stop publishing AiResponses this many DAA before the gate (~1 min at 10 BPS) so a
 /// v1-format tx cannot land in a ≥ H block during the submission→inclusion delay.
@@ -352,8 +355,16 @@ impl KeryxdHandler {
         if ready_ids.is_empty() {
             return; // no inference capability (mining itself is gated elsewhere)
         }
+        // Answer with the model already resident in VRAM so the synthetic task never
+        // forces an eviction/reload (the node validates the response against whatever
+        // model_id it carries — any served model is accepted). Only fall back to the
+        // protocol pick over downloaded models when nothing is resident yet (startup).
+        let answer_ids: Vec<[u8; 32]> = match keryx_miner::slm::resident_model_id() {
+            Some(m) if ready_ids.contains(&m) => vec![m],
+            _ => ready_ids,
+        };
         let seed = keryx_inference::synthetic::synthetic_seed(epoch, &pubkey);
-        let Some(req) = keryx_inference::synthetic::derive_synthetic_request(&seed, &ready_ids, epoch) else {
+        let Some(req) = keryx_inference::synthetic::derive_synthetic_request(&seed, &answer_ids, epoch) else {
             return;
         };
         let raw = req.serialize();
@@ -569,6 +580,12 @@ impl KeryxdHandler {
                 let _ = tx_done.send(result);
             });
             self.inference_rx = Some((raw, rx_done));
+            // GPU is now busy with an organic inference: raise the same flag the synthetic
+            // challenge uses, so the hashrate reporter shows "inference in progress" instead
+            // of falsely warning "workers stalled or crashed" while PoW is paused.
+            if let Some(flag) = &self.opoi_challenge_active {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -583,6 +600,10 @@ impl KeryxdHandler {
             self.inference_rx = Some((raw, rx));
             return false;
         };
+        // Organic inference finished (result or None): PoW resumes, so drop the GPU-busy flag.
+        if let Some(flag) = &self.opoi_challenge_active {
+            flag.store(false, Ordering::Relaxed);
+        }
         let Some(result) = result_opt else {
             // Inference returned None: model not ready or think block exhausted max_tokens.
             // Do NOT upload anything to IPFS — skip this AiResponse entirely.
