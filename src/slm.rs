@@ -130,32 +130,108 @@ fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
     exe_dir.join("models").join(spec.dir_name)
 }
 
+/// Downloads `url` to `dest` with automatic resume. A partially downloaded file is
+/// continued via an HTTP `Range` request instead of restarting from zero, and both
+/// connect-time and mid-stream failures are retried with a fixed backoff. Designed
+/// for the huge (10-40 GB) model GGUFs served over the flaky IPFS gateway: the
+/// content is immutable (CID-addressed), so appending resumed bytes is always
+/// consistent, and an already-complete file (e.g. pre-staged with `wget -c`) is
+/// detected via a 416 response and left untouched instead of being re-downloaded.
 fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 240; // survives long gateway outages (~40 min of retries)
+    const BACKOFF_SECS: u64 = 10;
     eprintln!("[keryx-miner] Downloading {} ...", url);
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| anyhow!("HTTP GET {}: {}", url, e))?;
-    let content_length: Option<u64> = response.header("Content-Length").and_then(|s| s.parse().ok());
-    let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(dest)
-        .with_context(|| format!("create {}", dest.display()))?;
-    let mut downloaded: u64 = 0;
-    let mut buf = vec![0u8; 65_536];
+    let mut attempt = 0u32;
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 { break; }
-        file.write_all(&buf[..n])?;
-        downloaded += n as u64;
-        if let Some(total) = content_length {
-            eprint!("\r  {:.1}/{:.1} MB ({}%)   ",
-                downloaded as f64 / 1_000_000.0,
-                total as f64 / 1_000_000.0,
-                downloaded * 100 / total);
-            let _ = std::io::stderr().flush();
+        // Resume offset = how many bytes we already have on disk.
+        let resume_from = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+
+        let mut req = ureq::get(url);
+        if resume_from > 0 {
+            req = req.set("Range", &format!("bytes={}-", resume_from));
         }
+        let response = match req.call() {
+            Ok(r) => r,
+            Err(e) => {
+                attempt += 1;
+                if attempt >= MAX_ATTEMPTS {
+                    return Err(anyhow!("HTTP GET {} failed after {} attempts: {}", url, attempt, e));
+                }
+                eprintln!("\n[keryx-miner] connect error ({e}); retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s (resume @ {} MB)…",
+                    resume_from / 1_000_000);
+                std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
+                continue;
+            }
+        };
+        let status = response.status();
+
+        // Decide whether to append (server honored the range) or (re)start, and the total size.
+        let (mut file, mut downloaded, total): (std::fs::File, u64, Option<u64>) =
+            if resume_from > 0 && status == 206 {
+                // Content-Range: "bytes <start>-<end>/<total>"
+                let total = response
+                    .header("Content-Range")
+                    .and_then(|cr| cr.rsplit('/').next())
+                    .and_then(|t| t.trim().parse::<u64>().ok());
+                let f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dest)
+                    .with_context(|| format!("open append {}", dest.display()))?;
+                (f, resume_from, total)
+            } else if resume_from > 0 && status == 416 {
+                // Range not satisfiable ⇒ the file is already fully downloaded.
+                eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                return Ok(());
+            } else {
+                // 200, or the server ignored Range ⇒ (re)start from scratch.
+                let total = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
+                let f = std::fs::File::create(dest)
+                    .with_context(|| format!("create {}", dest.display()))?;
+                (f, 0u64, total)
+            };
+
+        let mut reader = response.into_reader();
+        let mut buf = vec![0u8; 65_536];
+        let mut stream_err: Option<String> = None;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Err(e) = file.write_all(&buf[..n]) {
+                        stream_err = Some(e.to_string());
+                        break;
+                    }
+                    downloaded += n as u64;
+                    if let Some(t) = total {
+                        eprint!("\r  {:.1}/{:.1} MB ({}%)   ",
+                            downloaded as f64 / 1_000_000.0,
+                            t as f64 / 1_000_000.0,
+                            downloaded * 100 / t.max(1));
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+                Err(e) => { stream_err = Some(e.to_string()); break; }
+            }
+        }
+        let _ = file.flush();
+
+        // Done only if the stream ended cleanly AND we reached the known total.
+        let complete = stream_err.is_none() && total.map_or(true, |t| downloaded >= t);
+        if complete {
+            eprintln!();
+            return Ok(());
+        }
+
+        attempt += 1;
+        if attempt >= MAX_ATTEMPTS {
+            return Err(anyhow!("download {} interrupted after {} attempts (got {} MB)",
+                url, attempt, downloaded / 1_000_000));
+        }
+        let why = stream_err.unwrap_or_else(|| "short read".into());
+        eprintln!("\n[keryx-miner] interrupted ({why}); resuming {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s @ {} MB…",
+            downloaded / 1_000_000);
+        std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
     }
-    eprintln!();
-    Ok(())
 }
 
 fn ipfs_url(cid: &str) -> String {
@@ -296,6 +372,41 @@ fn cuda_pool_devices(primary: &Device) -> Vec<Device> {
     devices
 }
 
+/// Total VRAM (MB) of the smallest CUDA card in the rig, via `nvidia-smi`.
+/// Conservative (min across cards) so a model that fits the smallest card can be
+/// loaded on a single GPU. Returns `None` if nvidia-smi is unavailable.
+fn min_gpu_vram_mb() -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .min()
+}
+
+/// VRAM headroom (MB) reserved on top of the GGUF weight footprint for the KV
+/// cache, activations and CUDA workspace when deciding single-GPU vs layer-split.
+const SINGLE_GPU_HEADROOM_MB: u64 = 2_048;
+
+/// Under `--vram-pool`, decide whether a GGUF model must be layer-split across
+/// GPUs. A model that comfortably fits one card is loaded on a single GPU to avoid
+/// needless inter-GPU pipeline overhead (e.g. TinyLlama on a 6-GPU rig). When the
+/// per-card VRAM cannot be determined, defaults to splitting (previous behaviour).
+fn model_needs_pooling(gguf_path: &std::path::Path) -> bool {
+    let Some(card_mb) = min_gpu_vram_mb() else {
+        return true;
+    };
+    let model_mb = std::fs::metadata(gguf_path)
+        .map(|m| m.len() / (1024 * 1024))
+        .unwrap_or(u64::MAX);
+    model_mb.saturating_add(SINGLE_GPU_HEADROOM_MB) > card_mb
+}
+
 fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
     log::info!("SlmEngine: loading '{}'…", spec.name);
 
@@ -332,7 +443,7 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
             // --vram-pool: split layers evenly across every CUDA device so the
             // pooled VRAM can hold models no single card fits. Falls back to a
             // regular single-device load when only one GPU is present.
-            let inner = if vram_pool_enabled() && device.is_cuda() {
+            let inner = if vram_pool_enabled() && device.is_cuda() && model_needs_pooling(&gguf_path) {
                 let devices = cuda_pool_devices(&device);
                 if devices.len() >= 2 {
                     log::info!(
@@ -352,6 +463,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                     ModelInner::Quantized(model)
                 }
             } else {
+                if vram_pool_enabled() && device.is_cuda() {
+                    log::info!(
+                        "SlmEngine: '{}' fits a single GPU — loading on one device (no --vram-pool split)",
+                        spec.name
+                    );
+                }
                 let model = ModelWeights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load gguf weights: {}", e))?;
                 ModelInner::Quantized(model)
@@ -374,7 +491,7 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
             // --vram-pool: split layers across every CUDA device (e.g. DeepSeek-R1-32B
             // served by a rig of 8 GB cards). Falls back to single-device otherwise.
-            let inner = if vram_pool_enabled() && device.is_cuda() {
+            let inner = if vram_pool_enabled() && device.is_cuda() && model_needs_pooling(&gguf_path) {
                 let devices = cuda_pool_devices(&device);
                 if devices.len() >= 2 {
                     log::info!(
@@ -394,6 +511,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                     ModelInner::QuantizedQwen2(model)
                 }
             } else {
+                if vram_pool_enabled() && device.is_cuda() {
+                    log::info!(
+                        "SlmEngine: '{}' fits a single GPU — loading on one device (no --vram-pool split)",
+                        spec.name
+                    );
+                }
                 let model = Qwen2Weights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load qwen2 gguf weights: {}", e))?;
                 ModelInner::QuantizedQwen2(model)
@@ -416,7 +539,7 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                 .map_err(|e| anyhow!("read gguf: {}", e))?;
             // --vram-pool: split layers across every CUDA device (Qwen3-32B served by
             // a multi-GPU rig). Falls back to single-device otherwise.
-            let inner = if vram_pool_enabled() && device.is_cuda() {
+            let inner = if vram_pool_enabled() && device.is_cuda() && model_needs_pooling(&gguf_path) {
                 let devices = cuda_pool_devices(&device);
                 if devices.len() >= 2 {
                     log::info!(
@@ -436,6 +559,12 @@ fn load_engine(spec: &'static ModelSpec, device: Device) -> Result<SlmEngine> {
                     ModelInner::QuantizedQwen3(model)
                 }
             } else {
+                if vram_pool_enabled() && device.is_cuda() {
+                    log::info!(
+                        "SlmEngine: '{}' fits a single GPU — loading on one device (no --vram-pool split)",
+                        spec.name
+                    );
+                }
                 let model = Qwen3Weights::from_gguf(content, &mut gguf_file, &device)
                     .map_err(|e| anyhow!("load qwen3 gguf weights: {}", e))?;
                 ModelInner::QuantizedQwen3(model)
@@ -552,6 +681,18 @@ fn strip_think_block(text: &str) -> String {
     match text.find("</think>") {
         Some(end) => text[end + "</think>".len()..].trim().to_string(),
         None => String::new(),
+    }
+}
+
+/// Strip a self-emitted `<think>…</think>` block from models that are NOT primed
+/// with an already-open `<think>` (e.g. Qwen3 with `/no_think` still emits an empty
+/// `<think></think>` pair). Unlike [`strip_think_block`], when no closing tag is
+/// present the original text is returned (the model answered directly) — never an
+/// empty string — so a direct answer is preserved.
+fn strip_think_tags(text: &str) -> String {
+    match text.find("</think>") {
+        Some(end) => text[end + "</think>".len()..].trim().to_string(),
+        None => text.trim().to_string(),
     }
 }
 
@@ -763,7 +904,15 @@ fn generate(engine: &mut SlmEngine, prompt: &str, max_new_tokens: usize) -> Resu
     // For R1 models, strip the <think>…</think> reasoning preamble so only the
     // final answer is published. Empty string = think block was cut by max_tokens
     // (no final answer produced) — the caller should not upload this to IPFS.
-    Ok(if is_think_primed { strip_think_block(answer) } else { answer.to_string() })
+    // R1 models are primed with an open <think>; Qwen3 (ChatML + /no_think) still
+    // emits an empty <think></think> pair. Strip both so only the answer is published.
+    Ok(if is_think_primed {
+        strip_think_block(answer)
+    } else if matches!(engine.name, "qwen3-32b" | "qwen3-235b") {
+        strip_think_tags(answer)
+    } else {
+        answer.to_string()
+    })
 }
 
 fn sample_next(logits: &Tensor, lp: &mut LogitsProcessor, context: &[u32]) -> Result<u32> {
@@ -880,6 +1029,13 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
             .map(|s| s.model_id)
             .collect())
         .unwrap_or_default()
+}
+
+/// The model currently resident in the GPU engine (loaded in VRAM), if any.
+/// Used to answer the synthetic-liveness task with the already-loaded model so the
+/// task never forces an eviction/reload. Returns `None` when nothing is resident.
+pub fn resident_model_id() -> Option<[u8; 32]> {
+    ENGINE.lock().ok().and_then(|g| g.as_ref().map(|e| e.model_id))
 }
 
 /// True only when the model is supported and its files are completely downloaded.
