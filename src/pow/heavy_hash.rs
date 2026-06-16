@@ -15,15 +15,18 @@ const KERYX_MATRIX_SALT_V4: [u8; 32] = *b"KERYX:KeryxHash-v4:2026-06-07:xx";
 /// blocks will be rejected after activation — that is the forced-update mechanism.
 ///
 /// Mainnet: 17_275_000 (2026-05-30 ~15:00 UTC emergency activation)
-/// Testnet: 6_000
-pub const POW_SALT_V2_ACTIVATION_DAA: u64 = 17_275_000;
+/// Testnet: 0 (salt pinned to v4 from genesis — see params.rs TESTNET_PARAMS)
+/// TESTNET BUILD — revert to 17_275_000 before any mainnet build.
+pub const POW_SALT_V2_ACTIVATION_DAA: u64 = 0;
 
 /// DAA score at which the miner switches to SALT v4 (chain relaunch on stock difficulty) —
 /// must match `pow_salt_v4_activation` in network params. The matrix is generated host-side
 /// here (the CUDA kernel receives the precomputed matrix), so no kernel/PTX change is needed.
 ///
 /// Mainnet: 21_932_751 (same DAA as the old v3 gate; forks cleanly off the broken chain)
-pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 21_932_751;
+/// Testnet: 0 (salt pinned to v4 from genesis — see params.rs TESTNET_PARAMS)
+/// TESTNET BUILD — revert to 21_932_751 before any mainnet build.
+pub const POW_SALT_V4_ACTIVATION_DAA: u64 = 0;
 
 /// Returns the active matrix-salt version (1, 2 or 4) for a block at `daa_score`.
 /// Must mirror `active_salt_version` in `consensus/pow/src/lib.rs` (compared with `>=`).
