@@ -132,6 +132,11 @@ pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
 }
 
 const LOG_RATE: Duration = Duration::from_secs(10);
+// Number of consecutive all-zero hashrate ticks (outside an OPoI inference pause)
+// tolerated before reporting a real stall. A brief run of zeros is normal — model
+// load/eviction or a gap between block templates — so we wait past this grace window
+// to avoid scary "stalled or crashed" warnings during routine operation.
+const STALL_GRACE_TICKS: u32 = 3;
 
 impl MinerManager {
     pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager) -> Self {
@@ -432,51 +437,50 @@ impl MinerManager {
         let mut ticker = tokio::time::interval(LOG_RATE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_instant = ticker.tick().await;
+        // Consecutive all-zero ticks while NOT in an OPoI inference pause.
+        let mut zero_streak: u32 = 0;
         loop {
             let now = ticker.tick().await;
             let duration = (now - last_instant).as_secs_f64();
-            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed);
-            Self::log_single_hashrate(
-                &hashes_tried,
-                "Current hashrate is".into(),
-                "Workers stalled or crashed. Considered reducing workload and check that your node is synced",
-                duration,
-                false,
-                challenge_active,
-            );
-            for (device, rate) in &*hashes_by_worker.lock().unwrap() {
-                Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true, challenge_active);
-            }
             last_instant = now;
-        }
-    }
+            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed);
+            let total = hashes_tried.swap(0, Ordering::AcqRel);
 
-    fn log_single_hashrate(
-        counter: &Arc<AtomicU64>,
-        prefix: String,
-        warn_message: &str,
-        duration: f64,
-        keep_prefix: bool,
-        challenge_active: bool,
-    ) {
-        let hashes = counter.swap(0, Ordering::AcqRel);
-        let rate = (hashes as f64) / duration;
-        if hashes == 0 {
-            if challenge_active {
-                if keep_prefix {
-                    info!("{} OPoI challenge in progress — stand by", prefix);
-                } else {
-                    info!("OPoI challenge in progress — PoW paused, stand by");
+            if total > 0 {
+                // Mining normally: report aggregate + per-device rates.
+                zero_streak = 0;
+                let (rate, suffix) = Self::hash_suffix(total as f64 / duration);
+                info!("Current hashrate is {:.2} {}", rate, suffix);
+                for (device, counter) in &*hashes_by_worker.lock().unwrap() {
+                    let h = counter.swap(0, Ordering::AcqRel);
+                    let (r, s) = Self::hash_suffix(h as f64 / duration);
+                    info!("Device {}: {:.2} {}", device, r, s);
                 }
-            } else {
-                match keep_prefix {
-                    true => warn!("{}{}", prefix, warn_message),
-                    false => warn!("{}", warn_message),
-                };
+                continue;
             }
-        } else {
-            let (rate, suffix) = Self::hash_suffix(rate);
-            info!("{} {:.2} {}", prefix, rate, suffix);
+
+            // No hashes this tick — keep the per-device counters drained for the next window.
+            for (_device, counter) in &*hashes_by_worker.lock().unwrap() {
+                counter.store(0, Ordering::Release);
+            }
+
+            if challenge_active {
+                // PoW is intentionally paused while the GPU runs inference / loads a model.
+                zero_streak = 0;
+                info!("OPoI inference in progress — PoW paused, stand by");
+            } else {
+                zero_streak = zero_streak.saturating_add(1);
+                if zero_streak >= STALL_GRACE_TICKS {
+                    // Sustained zeros outside an inference pause — this is a real problem.
+                    warn!("Workers stalled or crashed. Consider reducing workload and check that your node is synced");
+                    for (device, _) in &*hashes_by_worker.lock().unwrap() {
+                        warn!("Device {}: 0 hash/s", device);
+                    }
+                } else {
+                    // Transient pause (model load/eviction or template gap) — not a crash yet.
+                    info!("PoW paused (OPoI inference / model load) — stand by");
+                }
+            }
         }
     }
 
