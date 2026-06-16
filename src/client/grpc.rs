@@ -355,14 +355,21 @@ impl KeryxdHandler {
         if ready_ids.is_empty() {
             return; // no inference capability (mining itself is gated elsewhere)
         }
-        // Pick a (per-epoch, pseudo-random) declared model so liveness rotates across
-        // everything we declared. The node accepts whatever model_id the response carries.
-        // The capability challenge is deferred at connect, so at startup this synthetic is
-        // the single inference that loads the first model. An occasional reload (when the
-        // pick differs from the resident model) is acceptable — often it lands on a light
-        // model anyway.
+        // Model choice (the node accepts whatever model_id the response carries):
+        //   - First answer of the session (boot): the highest declared model, so the rig
+        //     proves/serves its top tier right away. Capability is deferred at connect, so
+        //     this synthetic is the single boot inference.
+        //   - Later epochs: a per-epoch pseudo-random declared model, so liveness rotates
+        //     across everything we declared (an occasional reload is acceptable).
+        let answer_ids: Vec<[u8; 32]> = if self.last_synthetic_epoch.is_none() {
+            keryx_miner::slm::highest_loaded_model_id()
+                .map(|m| vec![m])
+                .unwrap_or(ready_ids)
+        } else {
+            ready_ids
+        };
         let seed = keryx_inference::synthetic::synthetic_seed(epoch, &pubkey);
-        let Some(req) = keryx_inference::synthetic::derive_synthetic_request(&seed, &ready_ids, epoch) else {
+        let Some(req) = keryx_inference::synthetic::derive_synthetic_request(&seed, &answer_ids, epoch) else {
             return;
         };
         let raw = req.serialize();

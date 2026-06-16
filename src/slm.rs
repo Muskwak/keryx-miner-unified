@@ -1031,6 +1031,19 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
         .unwrap_or_default()
 }
 
+/// The highest declared model (most VRAM required) that is fully downloaded, if any.
+/// Used to answer the first synthetic-liveness task of the session on the top tier, so
+/// a miner proves/serves its heaviest declared model right at boot.
+pub fn highest_loaded_model_id() -> Option<[u8; 32]> {
+    SUPPORTED_SPECS.get().and_then(|specs| {
+        specs
+            .iter()
+            .filter(|s| model_dir(s).join(".ok").exists())
+            .max_by_key(|s| s.min_vram_mb)
+            .map(|s| s.model_id)
+    })
+}
+
 /// True only when the model is supported and its files are completely downloaded.
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     let Some(specs) = SUPPORTED_SPECS.get() else { return false; };
