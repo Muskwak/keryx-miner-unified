@@ -4,7 +4,8 @@ use crate::pow::BlockSeed::{FullBlock, PartialBlock};
 use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
-    GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, KaspadMessage,
+    GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
+    GetUtxosByAddressesRequestMessage, GetUtxosByAddressesResponseMessage, KaspadMessage,
     NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
@@ -35,6 +36,18 @@ pub const OPOI_V2_ACTIVATION_DAA: u64 = 1_000;
 /// Stop publishing AiResponses this many DAA before the gate (~1 min at 10 BPS) so a
 /// v1-format tx cannot land in a ≥ H block during the submission→inclusion delay.
 const OPOI_V2_GATE_PAUSE: u64 = 600;
+
+/// Balance-reward hardfork activation DAA — MUST match `balance_reward_activation` in
+/// keryx-node params.rs. From this score we embed `/bal:<outpoints>` in the coinbase so the
+/// node scales our miner cut by our KRX holdings bracket. Testnet: 1_000.
+/// TESTNET BUILD — set to the concrete mainnet H before the v0.4.0 release.
+pub const BALANCE_REWARD_ACTIVATION_DAA: u64 = 1_000;
+
+/// How often the miner refreshes its `/bal:` outpoint cache from the node (GetUtxosByAddresses).
+const BAL_REFRESH_SECS: u64 = 30;
+
+/// Max `/bal:` outpoints to embed — MUST match `BALANCE_REWARD_MAX_OUTPOINTS` in keryx-node.
+const BAL_MAX_OUTPOINTS: usize = 8;
 
 #[allow(dead_code)]
 pub struct KeryxdHandler {
@@ -102,6 +115,15 @@ pub struct KeryxdHandler {
     /// node accepts our later blocks (which can't re-include the one-per-epoch answer
     /// tx) by following the reference to this annotated ancestor.
     live_anchor: Option<(String, u64)>,
+
+    /// Cached `/bal:<txid:idx,…>` tag embedded in the coinbase extra_data so the node scales
+    /// our miner cut by our KRX holdings bracket (balance-reward). Refreshed every
+    /// `BAL_REFRESH_SECS` from `GetUtxosByAddresses` on our payout address; empty until the
+    /// first response (⇒ floor bracket meanwhile).
+    bal_part: String,
+
+    /// Last time we issued the balance UTXO refresh request (throttle).
+    last_bal_refresh: Option<std::time::Instant>,
 }
 
 #[async_trait(?Send)]
@@ -225,6 +247,8 @@ impl KeryxdHandler {
             last_synthetic_epoch: None,
             current_answer: None,
             live_anchor: None,
+            bal_part: String::new(),
+            last_bal_refresh: None,
         }))
     }
 
@@ -284,7 +308,24 @@ impl KeryxdHandler {
             .as_ref()
             .map(|(hash, _)| format!("/live:{}", hash))
             .unwrap_or_default();
-        let extra_data = format!("{}{}/{}/ai:v1:{}{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part, live_part);
+        // Balance-reward: throttled refresh of our holdings outpoints (fire-and-forget; the
+        // GetUtxosByAddressesResponse updates `bal_part` asynchronously via handle_message), and
+        // embed the cached `/bal:` tag. Gated to balance_reward_activation; placed LAST in the
+        // extra_data so the node parses it until end-of-payload. Empty ⇒ floor bracket.
+        let bal_part = if self.last_known_daa >= BALANCE_REWARD_ACTIVATION_DAA {
+            let due = self.last_bal_refresh.map_or(true, |t| t.elapsed().as_secs() >= BAL_REFRESH_SECS);
+            if due {
+                self.last_bal_refresh = Some(std::time::Instant::now());
+                let _ = self
+                    .client_send(GetUtxosByAddressesRequestMessage { addresses: vec![self.miner_address.clone()] })
+                    .await;
+            }
+            self.bal_part.clone()
+        } else {
+            String::new()
+        };
+        let extra_data =
+            format!("{}{}/{}/ai:v1:{}{}{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part, live_part, bal_part);
         // Harvest a pending challenge response if the inference task just finished.
         let inference_result = match self.challenge_inference_rx.take() {
             Some((challenge_str, mut rx)) => match rx.try_recv() {
@@ -680,6 +721,30 @@ impl KeryxdHandler {
         true
     }
 
+    /// Rebuild the cached `/bal:` coinbase tag from a holdings query response: keep our largest
+    /// UTXOs (up to `BAL_MAX_OUTPOINTS`; consensus caps the summed balance at 1M KRX), formatted
+    /// as `/bal:<txid_hex>:<index>,…`. Prefers larger UTXOs (typically consolidated holdings).
+    fn refresh_bal_cache(&mut self, resp: GetUtxosByAddressesResponseMessage) {
+        let mut utxos: Vec<(u64, String, u32)> = resp
+            .entries
+            .into_iter()
+            .filter_map(|e| {
+                let op = e.outpoint?;
+                let amount = e.utxo_entry?.amount;
+                Some((amount, op.transaction_id, op.index))
+            })
+            .collect();
+        // Largest first → maximises the summed balance within the outpoint cap.
+        utxos.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        utxos.truncate(BAL_MAX_OUTPOINTS);
+        self.bal_part = if utxos.is_empty() {
+            String::new()
+        } else {
+            let refs: Vec<String> = utxos.iter().map(|(_, txid, idx)| format!("{}:{}", txid, idx)).collect();
+            format!("/bal:{}", refs.join(","))
+        };
+    }
+
     async fn handle_message(&mut self, msg: Payload, miner: &mut MinerManager) -> Result<(), Error> {
         match msg {
             // BlockAdded: scan confirmed block for AiRequests and escrow UTXOs.
@@ -808,6 +873,15 @@ impl KeryxdHandler {
                     if let Some(tx) = claim_tx {
                         self.client_send(KaspadMessage::submit_transaction(tx)).await?;
                     }
+                }
+            }
+            // Balance-reward: response to our throttled holdings query. Rebuild the cached
+            // `/bal:` tag from our largest UTXOs (consensus caps the sum at 1M KRX).
+            Payload::GetUtxosByAddressesResponse(resp) => {
+                if let Some(e) = resp.error {
+                    warn!("GetUtxosByAddressesResponse error: {}", e.message);
+                } else {
+                    self.refresh_bal_cache(resp);
                 }
             }
             Payload::SubmitBlockResponse(res) => match res.error {
