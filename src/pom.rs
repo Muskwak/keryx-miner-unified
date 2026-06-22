@@ -367,9 +367,9 @@ pub fn verify_proof(pre_pow_hash: &[u8; 32], nonce: u64, seed: u64, proof: &PomP
 
 /// Source of the raw 32 B canonical chunks for `read_chunk`.
 enum ChunkSource {
-    /// In-RAM chunks (synthetic tests / small indexes built without a GGUF). Only constructed
-    /// in tests; `read_chunk` still matches it, so keep the arm but silence dead_code in release.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// In-RAM chunks for the synthetic test helper (`synth_index`), built without a GGUF.
+    /// Test-only: production always uses `Gguf`, so it is compiled out of release builds.
+    #[cfg(test)]
     Ram(Vec<u8>),
     /// Chunks read on demand from the GGUF via `pread` — NO host copy (saves ~1x model size of
     /// RAM, ~42 GB for the 70B). `table[j] = (canonical chunk index of tensor j's first chunk,
@@ -458,6 +458,7 @@ impl WeightIndex {
     pub fn read_chunk(&self, off: u64) -> [u64; CHUNK_WORDS] {
         let mut arr = [0u8; 32];
         match &self.chunks {
+            #[cfg(test)]
             ChunkSource::Ram(data) => {
                 let base = (off as usize) * 32;
                 arr.copy_from_slice(&data[base..base + 32]);
