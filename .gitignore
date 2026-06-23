@@ -6,3 +6,4 @@ escrow_state.json
 .env
 
 target-hive/
+Cargo.lock
