@@ -82,7 +82,9 @@ Binary: `target-cuda/release/keryx-miner`
 |----------------|-------------|
 | RTX 30xx (Ampere) | `86` |
 | RTX 40xx (Ada Lovelace) | `89` |
-| RTX 50xx (Blackwell) | `100` |
+| RTX 50xx (Blackwell) | `89` |
+
+> **Blackwell (RTX 50xx) note.** The CUDA 12.2 toolkit cannot emit native `sm_100`/`sm_120` SASS (that needs CUDA ≥ 12.8), so do **not** set `CUDA_COMPUTE_CAP=100` with Option A/B — the build will fail. Use `89`: the `sm_89` PTX JIT-forwards to Blackwell at runtime via the driver, at no performance cost for these kernels. A native `sm_120` build would require a CUDA ≥ 12.8 toolchain and is currently untested.
 
 ---
 
