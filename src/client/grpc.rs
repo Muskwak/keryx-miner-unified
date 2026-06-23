@@ -422,7 +422,7 @@ impl KeryxdHandler {
             return None;
         }
         let v: serde_json::Value = serde_json::from_slice(&raw[PREFIX.len()..]).ok()?;
-        let model = v["m"].as_str().unwrap_or("tinyllama").to_string();
+        let model = v["m"].as_str().unwrap_or("gemma-3-4b").to_string();
         let prompt = v["p"].as_str()?.to_string();
         let max_tokens = v["n"].as_u64().unwrap_or(128) as usize;
         Some((model, prompt, max_tokens))
@@ -556,10 +556,18 @@ impl KeryxdHandler {
                     if daa > self.last_known_daa {
                         self.last_known_daa = daa;
                     }
+                    // OPoI v2 hardfork: hot-swap the served model lineup the moment the
+                    // chain reaches OPOI_V2_ACTIVATION_DAA (idempotent, no restart).
+                    keryx_miner::slm::advance_lineup_if_due(daa);
                 }
                 // Handle node-issued inference challenge: spawn an inference task if a new
-                // challenge arrived and no challenge is already in flight.
-                if !template.inference_challenge.is_empty() && self.challenge_inference_rx.is_none() {
+                // challenge arrived and no challenge is already in flight. Ignored under PoM — the
+                // per-block possession proof is the capability gate, so no synthetic challenge
+                // (defensive: holds even against a node that still issues them post-hardfork).
+                if !template.inference_challenge.is_empty()
+                    && self.challenge_inference_rx.is_none()
+                    && self.last_known_daa < keryx_miner::pom::POM_ACTIVATION_DAA
+                {
                     let challenge = template.inference_challenge.clone();
                     let mut parts = challenge.splitn(2, ':');
                     let model_id_hex = parts.next().unwrap_or("").to_string();
@@ -607,10 +615,7 @@ impl KeryxdHandler {
                 self.try_start_inference();
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
                 // This covers both regular AiRequest inference and node-issued challenge inference.
-                // In --cpu-inference mode the GPU is free, so keep hashing during inference.
-                if (self.inference_rx.is_some() || self.challenge_inference_rx.is_some())
-                    && !keryx_miner::slm::cpu_inference_enabled()
-                {
+                if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
                     miner.process_block(None).await?;
                     return Ok(());
                 }

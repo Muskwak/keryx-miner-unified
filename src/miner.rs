@@ -132,6 +132,11 @@ pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
 }
 
 const LOG_RATE: Duration = Duration::from_secs(10);
+// Number of consecutive all-zero hashrate ticks (outside an OPoI inference pause)
+// tolerated before reporting a real stall. A brief run of zeros is normal — model
+// load/eviction or a gap between block templates — so we wait past this grace window
+// to avoid scary "stalled or crashed" warnings during routine operation.
+const STALL_GRACE_TICKS: u32 = 3;
 
 impl MinerManager {
     pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager) -> Self {
@@ -249,6 +254,12 @@ impl MinerManager {
                 let mut nonces = vec![0u64; 1];
 
                 let mut state = None;
+                // PoM mining: nonce cursor + per-launch batch. The kernel grinds the whole batch
+                // before returning, so BPS_max = hashrate / POM_BATCH. At 1<<22 this capped a
+                // ~24 MH/s GPU at ~5.8 BPS. 1<<20 lifts the ceiling to ~23 BPS while staying well
+                // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
+                let mut pom_nonce: u64 = thread_rng().next_u64();
+                const POM_BATCH: u64 = 1 << 20;
 
                 loop {
                     nonces[0] = 0;
@@ -265,6 +276,49 @@ impl MinerManager {
                             }
                         };
                     }
+                    // PoM possession mining (design A): when active, the walk runs on the GPU
+                    // over the resident weights instead of kHeavyHash. On a winning nonce we build
+                    // the proof (host) and submit; the legacy plugin path below is skipped.
+                    if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                        let (pph, time, target_le) = {
+                            let s = state.as_ref().unwrap();
+                            let mut pph = [0u8; 32];
+                            pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                            let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
+                            (pph, time, s.target.to_le_bytes())
+                        };
+                        // An inference may have evicted the mining model (inference has priority).
+                        // Rebuild the walk (reloads the model resident) before mining resumes.
+                        if !keryx_miner::pom_gpu::is_installed() {
+                            keryx_miner::pom_gpu::ensure_installed();
+                        }
+                        let found = keryx_miner::pom_gpu::mine(&pph, time, &target_le, pom_nonce, POM_BATCH);
+                        pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
+                        hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        if let Some(nonce) = found {
+                            let built = state.as_ref().and_then(|s| {
+                                keryx_miner::pom::active_index().and_then(|(idx, tier)| s.generate_block_if_pom(nonce, idx, *tier))
+                            });
+                            if let Some(block_seed) = built {
+                                match send_channel.blocking_send(block_seed.clone()) {
+                                    Ok(()) => block_seed.report_block(),
+                                    Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                                }
+                                if let BlockSeed::FullBlock(_) = block_seed {
+                                    state = None;
+                                }
+                            }
+                        } else if let Some(cmd) = block_channel.get_changed()? {
+                            state = match cmd {
+                                Some(WorkerCommand::Job(ns)) => Some(ns),
+                                Some(WorkerCommand::Close) => return Ok(()),
+                                None => state,
+                            };
+                        }
+                        continue;
+                    }
+
                     let state_ref = match &state {
                         Some(s) => {
                             s.load_to_gpu(gpu_work);
@@ -279,7 +333,9 @@ impl MinerManager {
                     }
 
                     gpu_work.copy_output_to(&mut nonces)?;
-                    if nonces[0] != 0 {
+                    // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
+                    // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
+                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::POM_ACTIVATION_DAA {
                         if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(),
@@ -390,7 +446,13 @@ impl MinerManager {
                     };
                     nonce = (nonce & mask) | fixed;
 
-                    if let Some(block_seed) = state_ref.generate_block_if_pow(nonce.0) {
+                    // PoM possession path (CPU) once active; else legacy kHeavyHash.
+                    let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
+                        keryx_miner::pom::active_index().and_then(|(idx, tier)| state_ref.generate_block_if_pom(nonce.0, idx, *tier))
+                    } else {
+                        state_ref.generate_block_if_pow(nonce.0)
+                    };
+                    if let Some(block_seed) = found {
                         match send_channel.blocking_send(block_seed.clone()) {
                             Ok(()) => block_seed.report_block(),
                             Err(e) => error!("Failed submitting block: ({})", e.to_string()),
@@ -432,51 +494,52 @@ impl MinerManager {
         let mut ticker = tokio::time::interval(LOG_RATE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_instant = ticker.tick().await;
+        // Consecutive all-zero ticks while NOT in an OPoI inference pause.
+        let mut zero_streak: u32 = 0;
         loop {
             let now = ticker.tick().await;
             let duration = (now - last_instant).as_secs_f64();
-            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed);
-            Self::log_single_hashrate(
-                &hashes_tried,
-                "Current hashrate is".into(),
-                "Workers stalled or crashed. Considered reducing workload and check that your node is synced",
-                duration,
-                false,
-                challenge_active,
-            );
-            for (device, rate) in &*hashes_by_worker.lock().unwrap() {
-                Self::log_single_hashrate(rate, format!("Device {}:", device), "0 hash/s", duration, true, challenge_active);
-            }
             last_instant = now;
-        }
-    }
+            // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
+            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
+                || keryx_miner::pom_gpu::is_loading();
+            let total = hashes_tried.swap(0, Ordering::AcqRel);
 
-    fn log_single_hashrate(
-        counter: &Arc<AtomicU64>,
-        prefix: String,
-        warn_message: &str,
-        duration: f64,
-        keep_prefix: bool,
-        challenge_active: bool,
-    ) {
-        let hashes = counter.swap(0, Ordering::AcqRel);
-        let rate = (hashes as f64) / duration;
-        if hashes == 0 {
-            if challenge_active {
-                if keep_prefix {
-                    info!("{} OPoI challenge in progress — stand by", prefix);
-                } else {
-                    info!("OPoI challenge in progress — PoW paused, stand by");
+            if total > 0 {
+                // Mining normally: report aggregate + per-device rates.
+                zero_streak = 0;
+                let (rate, suffix) = Self::hash_suffix(total as f64 / duration);
+                info!("Current hashrate is {:.2} {}", rate, suffix);
+                for (device, counter) in &*hashes_by_worker.lock().unwrap() {
+                    let h = counter.swap(0, Ordering::AcqRel);
+                    let (r, s) = Self::hash_suffix(h as f64 / duration);
+                    info!("Device {}: {:.2} {}", device, r, s);
                 }
-            } else {
-                match keep_prefix {
-                    true => warn!("{}{}", prefix, warn_message),
-                    false => warn!("{}", warn_message),
-                };
+                continue;
             }
-        } else {
-            let (rate, suffix) = Self::hash_suffix(rate);
-            info!("{} {:.2} {}", prefix, rate, suffix);
+
+            // No hashes this tick — keep the per-device counters drained for the next window.
+            for (_device, counter) in &*hashes_by_worker.lock().unwrap() {
+                counter.store(0, Ordering::Release);
+            }
+
+            if challenge_active {
+                // PoW is intentionally paused while the GPU runs inference / loads a model.
+                zero_streak = 0;
+                info!("OPoI inference in progress — PoW paused, stand by");
+            } else {
+                zero_streak = zero_streak.saturating_add(1);
+                if zero_streak >= STALL_GRACE_TICKS {
+                    // Sustained zeros outside an inference pause — this is a real problem.
+                    warn!("Workers stalled or crashed. Consider reducing workload and check that your node is synced");
+                    for (device, _) in &*hashes_by_worker.lock().unwrap() {
+                        warn!("Device {}: 0 hash/s", device);
+                    }
+                } else {
+                    // Transient pause (model load/eviction or template gap) — not a crash yet.
+                    info!("PoW paused (OPoI inference / model load) — stand by");
+                }
+            }
         }
     }
 

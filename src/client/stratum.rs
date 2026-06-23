@@ -642,15 +642,10 @@ impl StratumHandler {
         }
 
         // Pause PoW so the GPU is fully available for the challenge inference.
-        // In --cpu-inference mode the GPU is free, so keep hashing during the challenge.
         let miner_flag = miner.opoi_challenge_flag();
-        if keryx_miner::slm::cpu_inference_enabled() {
-            info!("OPoI challenge: CPU inference — PoW continues — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
-        } else {
-            miner_flag.store(true, Ordering::SeqCst);
-            miner.process_block(None).await.ok();
-            info!("OPoI challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
-        }
+        miner_flag.store(true, Ordering::SeqCst);
+        miner.process_block(None).await.ok();
+        info!("OPoI challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
 
         let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
         let send_channel = self.send_channel.clone();
@@ -726,16 +721,10 @@ impl StratumHandler {
         }
 
         // Pause PoW — running kHeavyHash and SLM inference simultaneously crashes the GPU.
-        // In --cpu-inference mode the GPU is free, so keep hashing during inference.
-        let cpu_inference = keryx_miner::slm::cpu_inference_enabled();
         let miner_flag = miner.opoi_challenge_flag();
-        if !cpu_inference {
-            miner_flag.store(true, Ordering::SeqCst);
-            miner.process_block(None).await.ok();
-            info!("OPoI AiTask [{}]: PoW suspended for GPU inference", task.stable_id);
-        } else {
-            info!("OPoI AiTask [{}]: CPU inference — PoW continues", task.stable_id);
-        }
+        miner_flag.store(true, Ordering::SeqCst);
+        miner.process_block(None).await.ok();
+        info!("OPoI AiTask [{}]: PoW suspended for GPU inference", task.stable_id);
 
         // Mark in-progress and spawn the blocking inference + IPFS upload.
         {
@@ -756,9 +745,8 @@ impl StratumHandler {
             challenge_flag.store(false, Ordering::SeqCst);
         });
 
-        // GPU mode: PoW was paused, caller must not feed a new block (returns true).
-        // CPU mode: PoW kept running, caller should feed a block to keep hashing (returns false).
-        !cpu_inference
+        // PoW was paused for GPU inference, so the caller must not feed a new block.
+        true
     }
 }
 

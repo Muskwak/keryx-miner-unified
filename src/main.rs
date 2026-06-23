@@ -120,11 +120,11 @@ fn filter_plugins(dirname: &str) -> Vec<String> {
 
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
 ///
-/// VRAM requirements (GGUF weights only, not counting CUDA workspace):
-///   TinyLlama-1.1B  →  ~1.5 GB
-///   DeepSeek-R1-8B  →  ~5 GB
-///   DeepSeek-R1-32B → ~19 GB   (requires ≥24 GB card)
-///   LLaMA-3.3-70B   → ~28 GB   (requires ≥40 GB card — does NOT fit on RTX 3090)
+/// VRAM requirements (GGUF Q4_K_M weights only, not counting CUDA workspace):
+///   Gemma-3-4B      →  ~2.7 GB
+///   Dolphin-8B      →  ~4.9 GB
+///   Qwen3-32B       → ~19.5 GB  (requires ≥24 GB card)
+///   Llama-3.3-70B   → ~42.5 GB  (requires ≥48 GB card)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
@@ -135,41 +135,104 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
         ])
         .output();
 
+    // nvidia-smi prints one line per GPU; the power + VRAM check applies to GPU 0
+    // (the device the miner mines/serves on).
     let (current_w, vram_mb) = match output {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            let mut parts = s.trim().split(',');
-            let cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-            let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
-            let vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
-            (cur as u32, vram)
+            let mut cur = 0u32;
+            let mut vram = 0u64;
+            for (i, line) in s.trim().lines().take(1).enumerate() {
+                let mut parts = line.split(',');
+                let line_cur: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+                let _max: f32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0.0);
+                let line_vram: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                if i == 0 {
+                    cur = line_cur as u32;
+                }
+                vram += line_vram;
+            }
+            (cur, vram)
         }
         _ => return,
     };
 
-    // VRAM check for 70B: 28 GB weights + ~2.5 GB KV cache → requires ≥32 GB card (RTX 5090+).
-    // On 24 GB cards (RTX 3090 / 4090), loading will OOM and crash the miner.
-    if needs_very_high && vram_mb < 30_000 {
-        log::error!(
-            "✗  LLaMA-3.3-70B requires ≥32 GB VRAM (RTX 5090 or equivalent) — \
-             this GPU has only {} MB ({} GB).",
-            vram_mb,
-            vram_mb / 1024
-        );
-        log::error!(
-            "   Use --high (DeepSeek-R1-32B, fits in 24 GB) or --light (TinyLlama only)."
-        );
-        // Non-fatal: let candle fail with its own OOM so the miner logs the actual error.
-    }
-
-    let model_label = if needs_very_high {
-        "LLaMA-3.3-70B (--very-high)"
+    // VRAM sufficiency for the selected tier (Q4_K_M weights + KV cache + CUDA workspace).
+    // Insufficient VRAM means GPU inference for this tier will OOM. This is non-fatal — a
+    // host/CPU path can still serve it — so warn rather than error, and do NOT then claim the
+    // model is "ready" on the same GPU (the contradictory ERROR-then-ready pair).
+    let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
+        ("Llama-3.3-70B (--very-high)", 46_000)
     } else if needs_high {
-        "DeepSeek-R1-32B (--high)"
+        ("Qwen3-32B (--high)", 20_000)
     } else {
-        "DeepSeek-R1-8B (default)"
+        ("Dolphin-8B (default)", 8_000)
     };
-    log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
+
+    if vram_mb < min_vram_mb {
+        log::warn!(
+            "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
+             will OOM. Use a smaller tier (--high Qwen3-32B / --light Gemma-3-4B) or serve it \
+             via a host/CPU path.",
+            model_label,
+            min_vram_mb / 1024,
+            vram_mb / 1024,
+        );
+    } else {
+        log::info!("GPU: {}W PL, {} MB VRAM — ready for {}", current_w, vram_mb, model_label);
+    }
+}
+
+/// GPU 0 total VRAM (MB) via nvidia-smi, or None when nvidia-smi is unavailable or
+/// unparseable (e.g. AMD-only machines). GPU 0 is the device the miner mines/serves on.
+fn query_vram_mb() -> Option<u64> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+}
+
+/// OPoI capability gate (layer A): drop the models this machine cannot actually
+/// serve on GPU 0, so the `ai:cap` announcement never promises a model the miner
+/// would fail to load. Skipped when nvidia-smi is unavailable (CPU-fallback setups
+/// keep working).
+fn filter_specs_by_vram(
+    specs: &'static [&'static keryx_miner::models::ModelSpec],
+) -> &'static [&'static keryx_miner::models::ModelSpec] {
+    let Some(gpu0_mb) = query_vram_mb() else {
+        log::warn!("Cannot query GPU VRAM (nvidia-smi) — skipping the model capability gate.");
+        return specs;
+    };
+    let kept: Vec<&'static keryx_miner::models::ModelSpec> = specs
+        .iter()
+        .copied()
+        .filter(|spec| {
+            if spec.min_vram_mb <= gpu0_mb {
+                true
+            } else {
+                log::warn!(
+                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on GPU 0 — model NOT announced (ai:cap) and not downloaded.",
+                    spec.name,
+                    spec.min_vram_mb,
+                    gpu0_mb,
+                );
+                false
+            }
+        })
+        .collect();
+    if kept.len() == specs.len() {
+        specs
+    } else {
+        // Leaked once at startup to keep the &'static API of init_supported.
+        Box::leak(kept.into_boxed_slice())
+    }
 }
 
 async fn get_client(
@@ -344,46 +407,68 @@ async fn main() -> Result<(), Error> {
         }
     };
 
-    // Phase-3 OPoI: load inference models before mining starts.
-    //   (no flag)    → TinyLlama + DeepSeek-R1-8B  [default]
-    //   --light      → TinyLlama only
-    //   --high       → TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B
-    //   --very-high  → all 4 models
+    // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
+    // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
+    // property, not a per-GPU one.
+    //   (no flag)    → Dolphin-8B   [default]
+    //   --light      → Gemma-3-4B
+    //   --high       → Qwen3-32B
+    //   --very-high  → Llama-3.3-70B
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
     check_gpu_power_limit(opt.high || opt.very_high, opt.very_high);
 
-    let specs: &'static [&'static keryx_miner::models::ModelSpec] = if opt.very_high {
-        info!("--very-high mode: loading all 4 models (TinyLlama + DeepSeek-8B + DeepSeek-32B + LLaMA-70B).");
-        &[
-            &keryx_miner::models::TINYLLAMA,
-            &keryx_miner::models::DEEPSEEK_R1_8B,
-            &keryx_miner::models::DEEPSEEK_R1_32B,
-            &keryx_miner::models::LLAMA_3_3_70B,
-        ]
+    let tier = if opt.very_high {
+        info!("--very-high mode: top tier — mines Llama-3.3-70B under PoM.");
+        keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: loading TinyLlama + DeepSeek-R1-8B + DeepSeek-R1-32B.");
-        &[
-            &keryx_miner::models::TINYLLAMA,
-            &keryx_miner::models::DEEPSEEK_R1_8B,
-            &keryx_miner::models::DEEPSEEK_R1_32B,
-        ]
+        info!("--high mode: high tier — mines Qwen3-32B under PoM.");
+        keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: loading TinyLlama only.");
-        &[&keryx_miner::models::TINYLLAMA]
+        info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
+        keryx_miner::models::Tier::Light
     } else {
-        &[&keryx_miner::models::TINYLLAMA, &keryx_miner::models::DEEPSEEK_R1_8B]
+        info!("default mode: mines Dolphin-8B under PoM.");
+        keryx_miner::models::Tier::Default
     };
-    keryx_miner::slm::init_supported(specs);
-    keryx_miner::slm::set_cpu_inference(opt.cpu_inference);
-    if opt.cpu_inference {
-        info!("--cpu-inference mode: OPoI inference runs on CPU, GPU stays dedicated to hashing.");
-    }
-    info!("OPoI Phase-3 active — {} model(s) supported.", specs.len());
-    info!("Prefetching model files before mining starts…");
-    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs)).await {
-        Ok(Ok(())) => info!("Model files ready — starting mining."),
+    // OPoI v2 hardfork: the model lineup is DAA-gated (mirrors the node's
+    // opoi_v2_activation). Stage BOTH lineups for this tier — each filtered by what
+    // this hardware can serve (layer-A capability gate) — so the chain crossing
+    // hot-swaps without a restart:
+    //   - legacy (daa < H) is prefetched now and mined immediately;
+    //   - uncensored (daa >= H) is prefetched in the background and swapped in at H.
+    // `specs_v1` is the CURRENT (legacy, daa < H) lineup the miner announces and serves until the
+    // chain crosses H — `specs_for(0, ..)` so a fresh chain declares the legacy models.
+    let specs_v1 = filter_specs_by_vram(keryx_miner::models::specs_for(0, tier));
+    let specs_v2 = filter_specs_by_vram(
+        keryx_miner::models::specs_for(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, tier),
+    );
+    // PoM: pick the highest tier this miner serves that has a pinned R_T (the model it will
+    // mine under possession). Captured before `specs_v2` is consumed; the index is built after
+    // prefetch (below). `&'static ModelSpec` is Copy so this survives the moves.
+    let pom_spec = if keryx_miner::pom::POM_ACTIVATION_DAA != u64::MAX {
+        specs_v2
+            .iter()
+            .copied()
+            .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id).is_some())
+            .max_by_key(|s| s.min_vram_mb)
+    } else {
+        None
+    };
+    keryx_miner::slm::set_v2_lineup(specs_v2);
+    keryx_miner::slm::init_supported(specs_v1);
+    log::debug!(
+        "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
+        specs_v1.len(),
+        specs_v2.len(),
+        keryx_miner::models::OPOI_V2_ACTIVATION_DAA
+    );
+    // Block on BOTH lineups before mining: never start hashing while a model this miner
+    // will serve — the legacy set now AND the uncensored set after the hardfork swap — is
+    // still downloading. The readiness-gated swap then activates v2 instantly at H.
+    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v1)).await {
+        Ok(Ok(())) => log::debug!("Legacy model files ready."),
         Ok(Err(e)) => {
             error!("Model prefetch failed — refusing to mine without inference capability: {}", e);
             return Err(e.into());
@@ -393,16 +478,40 @@ async fn main() -> Result<(), Error> {
             return Err(e.into());
         }
     }
+    match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
+        Ok(Ok(())) => info!("Model files ready — starting mining."),
+        Ok(Err(e)) => {
+            error!("OPoI v2 prefetch failed — refusing to mine without the post-hardfork lineup: {}", e);
+            return Err(e.into());
+        }
+        Err(e) => {
+            error!("Model prefetch task panicked: {}", e);
+            return Err(e.into());
+        }
+    }
+    // PoM possession setup is fully LAZY: nothing GPU- or host-heavy happens at boot. During the
+    // pre-PoM legacy phase the GPU + host stay free for the legacy lineup (mining + inference start
+    // immediately). The possession index AND the GPU walk are built by the mining loop the first
+    // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
+    if let Some(spec) = pom_spec {
+        let tier = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
+        let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        // Force the single-device split loader so the mining tier exposes its quant tensors for
+        // zero-dup sharing, and record the tier so the walk can be built on demand.
+        keryx_miner::slm::set_pom_force_split(true);
+        keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
+        info!("PoM: configured for tier {} ({}); index + GPU walk load lazily when PoM activates (DAA {}).",
+            tier, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+    }
+
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner
     // that cannot run inference must fail fast with a clear message rather than spam panics.
-    if opt.cpu_inference {
-        info!("--cpu-inference: skipping GPU inference probe (inference runs on CPU).");
-    } else {
     info!("Probing GPU inference (cuBLAS) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
         Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS loaded successfully."),
         Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
-            warn!("No CUDA device detected — inference will run on CPU (small models only, slow).");
+            error!("No CUDA device detected — OPoI inference is GPU-only and is mandatory, cannot mine.");
+            return Err("No CUDA device — cannot start OPoI mining".into());
         }
         Ok(keryx_miner::slm::GpuProbe::CublasMissing) => {
             warn!("CUDA GPU detected but a CUDA runtime lib is missing — installing them automatically (one-time)…");
@@ -437,7 +546,6 @@ async fn main() -> Result<(), Error> {
             error!("GPU probe task panicked: {}", e);
             return Err(e.into());
         }
-    }
     }
     info!("Found plugins: {:?}", plugins);
     info!("Plugins found {} workers", worker_count);

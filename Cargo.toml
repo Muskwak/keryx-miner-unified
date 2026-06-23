@@ -49,10 +49,13 @@ hex = "0.4"
 keryx-inference = { path = "inference" }
 secp256k1 = { version = "0.29.0", features = ["global-context"] }
 semver = "1.0"
+# Proof-of-Model: possession proof construction (borsh wire-format must match the node).
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
 # Phase-3 OPoI: SLM inference via candle
-candle-core = { version = "0.8", features = ["cuda"] }
-candle-transformers = { version = "0.8", features = ["cuda"] }
-candle-nn = { version = "0.8", features = ["cuda"] }
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-transformers = { version = "0.9", features = ["cuda"] }
+candle-nn = { version = "0.9", features = ["cuda"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 ureq = { version = "2", features = ["tls"] }
 base64 = "0.22"
@@ -88,3 +91,10 @@ sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 [workspace]
 members = ["inference", "plugins/*"]
 default-members = [".", "plugins/cuda", "plugins/opencl"]
+
+# Vendored candle-kernels: the upstream MoE bf16 WMMA kernels only compile for
+# sm_80+, which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
+# inference. The vendored copy guards those kernel bodies with `#if __CUDA_ARCH__
+# >= 800` so the crate builds at sm_75 (stub on older archs, real MoE on sm_80+).
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }

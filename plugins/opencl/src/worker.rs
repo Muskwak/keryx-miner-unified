@@ -22,6 +22,24 @@ use std::sync::Arc;
 static BINARY_DIR: Dir = include_dir!("./plugins/opencl/resources/bin/");
 static PROGRAM_SOURCE: &str = include_str!("../resources/keryx-opencl.cl");
 
+/// Capability-driven default for the `--opencl-workload` ratio when the user
+/// didn't set it. The ratio is multiplied by (max_work_group_size * compute_units)
+/// downstream, so a bigger card needs a *smaller* ratio for the same nonce count.
+/// Tuned on the live pool (0 rejects): the old flat 512 under-saturated both the
+/// 60-CU gfx906 MI50 (best at 2048 → +24-33%) and the 16-CU gfx1102 7600 XT
+/// (best at 4096 → +10%). Grouped by family for the archs not directly measured;
+/// unknown archs keep the conservative legacy 512.
+fn default_workload_scale(arch: &str) -> f32 {
+    match arch {
+        // CDNA / GCN5 MI-series — high CU count, wave64; saturates at a lower ratio.
+        "gfx906" | "gfx908" | "gfx90a" | "gfx940" | "gfx941" | "gfx942" => 2048.,
+        // RDNA 3/4 — fewer CUs; wants a higher ratio to saturate.
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1200" | "gfx1201" => 4096.,
+        // Untested / older archs: keep the conservative legacy default.
+        _ => 512.,
+    }
+}
+
 pub struct OpenCLGPUWorker {
     context: Arc<Context>,
     random: NonceGenEnum,
@@ -174,13 +192,31 @@ impl OpenCLGPUWorker {
             device.extensions().unwrap_or_else(|_| "NA".into())
         );
 
+        // Normalised arch string ("gfx906", "gfx1102", …) — ROCm reports it as
+        // e.g. "gfx906:sramecc+:xnack-", so strip the feature suffix. Used both for
+        // the capability-driven workload default and the v_dot8 gate below.
+        let arch = device
+            .name()
+            .unwrap_or_else(|_| "Unknown".into())
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+
         let local_size = device.max_work_group_size().map_err(|e| e.to_string())?;
         let chosen_workload = match is_absolute {
             true => workload as usize,
             false => {
                 let max_work_group_size =
                     (local_size * (device.max_compute_units().map_err(|e| e.to_string())? as usize)) as f32;
-                (workload * max_work_group_size) as usize
+                // workload <= 0 is the AUTO sentinel (no --opencl-workload given):
+                // pick a per-arch ratio that saturates the card. The ratio is scaled
+                // by CU count here, so larger cards need a smaller ratio. Measured on
+                // the live pool, 0 rejects: gfx906 MI50 316→~393 MH/s @2048, gfx1102
+                // 7600 XT 301→~332 MH/s @4096 vs the old flat 512. An explicit
+                // --opencl-workload always overrides this.
+                let ratio = if workload > 0. { workload } else { default_workload_scale(&arch) };
+                (ratio * max_work_group_size) as usize
             }
         };
         info!("{}: Chosen workload is {}", name, chosen_workload);
@@ -188,18 +224,32 @@ impl OpenCLGPUWorker {
             Arc::new(Context::from_device(&device).unwrap_or_else(|_| panic!("{}::Context::from_device failed", name)));
         let context_ref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };
 
-        let options = match experimental_amd {
+        // v_dot8_u32_u4 (packed 4-bit dot product, 8 MACs/instr) is the fast path for
+        // the 64x64 matrix multiply — half the dot instructions of v_dot4_u32_u8.
+        // Every arch implementing the DLOPS dot instructions should use it, so make
+        // it capability-driven (the default; no flag needed). The legacy
+        // `--experimental-amd` flag still forces it on for capable archs not in the
+        // default list below. (`arch` is computed above for the workload default.)
+        // DLOPS-capable archs that ship WITHOUT a precompiled v_dot4 binary, so the JIT
+        // path can emit the packed v_dot8 kernel with no .bin/host-layout mismatch:
+        // CDNA / GCN5 MI-series (gfx9xx) and RDNA 3/4 (gfx11xx/12xx). The RDNA 1.5/2
+        // parts (gfx1011/1012/1030-1034) also support v_dot8 but ship a v_dot4 .bin,
+        // so they stay on v_dot4 until those binaries are regenerated.
+        let vdot8_default = matches!(
+            arch.as_str(),
+            "gfx906" | "gfx908" | "gfx90a" | "gfx940" | "gfx941" | "gfx942"
+                | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1200" | "gfx1201"
+        );
+        // Also v_dot8-capable, but only opt-in (they have a shipped v_dot4 .bin).
+        let vdot8_capable = vdot8_default
+            || matches!(arch.as_str(), "gfx1011" | "gfx1012" | "gfx1030" | "gfx1031" | "gfx1032" | "gfx1034");
+        let experimental_amd_use = vdot8_default || (experimental_amd && vdot8_capable);
+
+        let options = match experimental_amd_use {
             // true => "-D __FORCE_AMD_V_DOT4_U32_U8__=1 ",
             true => "-D __FORCE_AMD_V_DOT8_U32_U4__=1 ",
             false => "",
         };
-
-        // Architectures that do NOT support v_dot4_u32_u8 / v_dot8_u32_u4.
-        // RDNA 3 (gfx1100+) and RDNA 4 (gfx1200+) DO support these and must NOT be added here.
-        let experimental_amd_use = !matches!(
-            device.name().unwrap_or_else(|_| "Unknown".into()).to_lowercase().as_str(),
-            "tahiti" | "ellesmere" | "gfx1010" | "gfx906" | "gfx908"
-        );
 
         let program = match use_binary {
             true => {
@@ -320,7 +370,11 @@ impl OpenCLGPUWorker {
             matrix,
             target,
             events: Vec::<cl_event>::new(),
-            experimental_amd: (experimental_amd & experimental_amd_use),
+            // Must equal the kernel's v_dot8 decision: this flag drives the packed
+            // (2-nibbles/byte) matrix upload in load_block_constants, which the
+            // v_dot8_u32_u4 kernel requires. `experimental_amd_use` already folds in
+            // both the capability default and the legacy --experimental-amd flag.
+            experimental_amd: experimental_amd_use,
         })
     }
 }
@@ -360,7 +414,16 @@ fn from_source(context: &Context, device: &Device, options: &str) -> Result<Prog
     // Hack to recreate the AMD flags
     compile_options += &match device.pcie_id_amd() {
         Ok(_) => {
-            let device_name = device.name().unwrap_or_else(|_| "Unknown".into()).to_lowercase();
+            // ROCm reports gfx906/gfx90a as e.g. "gfx906:sramecc+:xnack-". The ':'
+            // and '+'/'-' are not valid in a preprocessor macro name, so
+            // `-D __<name>__` would define a garbage symbol and `__gfx906__` would
+            // never be set — silently dropping the JIT path onto the scalar
+            // fallback. Strip the target-feature suffix (the binary-lookup path
+            // above already does this) so `__gfx906__` is defined cleanly.
+            let mut device_name = device.name().unwrap_or_else(|_| "Unknown".into()).to_lowercase();
+            if let Some((base, _)) = device_name.split_once(':') {
+                device_name = base.to_string();
+            }
             format!("-D OPENCL_PLATFORM_AMD -D __{}__ ", device_name)
         }
         Err(_) => String::new(),

@@ -313,7 +313,12 @@ void STATIC inline _amul4bit(__constant uint32_t packed_vec1[32], uint32_t packe
     }
     *ret = res;
 }
-#elif (defined(OFFLINE) && (defined(__gfx906__) || defined(__gfx908__))) || defined(__gfx1011__) || defined(__gfx1012__) || defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+// gfx906 (Vega 20 / MI50-MI60) and gfx908 (MI100) implement the DLOPS dot-product
+// instructions (v_dot4_u32_u8 / v_dot8_u32_u4) natively — that is their headline
+// feature — and ROCm's online OpenCL compiler emits them fine. They were previously
+// gated behind -DOFFLINE (only the AOT path), which dropped the MI50 onto the slow
+// scalar fallback. Enable them unconditionally like the RDNA parts.
+#elif defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx1011__) || defined(__gfx1012__) || defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
 #define amul4bit(X,Y,Z) _amul4bit((constant uint32_t*)(X), (private uint32_t*)(Y), (uint32_t *)(Z))
 void STATIC inline _amul4bit(__constant uint32_t packed_vec1[32], uint32_t packed_vec2[32], uint32_t *ret) {
     // We assume each 32 bits have four values: A0 B0 C0 D0
@@ -360,6 +365,18 @@ void STATIC inline _amul4bit(__constant uchar4 packed_vec1[32], uchar4 packed_ve
 #endif
 #define SWAP4( x ) as_uint( as_uchar4( x ).wzyx )
 
+// Occupancy hint (AMD), OPT-IN only — do NOT enable by default.
+// The kernel naturally compiles to 65 VGPRs / 0 spills on gfx906 (wave64) →
+// 256/ceil(65,4) = 3 waves/SIMD. The only way to reach 4 waves (<=64 VGPRs) is to
+// force the allocator past the cliff, which spills 4 VGPRs to scratch (waves=4 →
+// 0, waves=5 → 2148 spills). Spilling on gfx906 destabilized the compute queues in
+// testing (kfd stall), so the register cliff is not safely crossable from source —
+// the stable optimum is the natural 65-VGPR / 3-wave build (this kernel, no hint).
+// Kept as a documented knob for experimenting on other archs/drivers; enable with
+// -D KERYX_WAVES_PER_EU=N. Use kdump.c to inspect .vgpr_count/.vgpr_spill_count.
+#if defined(OPENCL_PLATFORM_AMD) && defined(KERYX_WAVES_PER_EU)
+__attribute__((amdgpu_waves_per_eu(KERYX_WAVES_PER_EU)))
+#endif
 kernel void heavy_hash(
     const ulong local_size,
     const ulong nonce_mask,

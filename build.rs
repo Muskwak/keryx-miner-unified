@@ -15,6 +15,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto/rpc.proto", "proto/p2p.proto", "proto/messages.proto"],
             &["proto"],
         )?;
+    // PoM mining kernel → PTX (loaded at runtime into candle's CUDA context). nvcc 12.2 (PATH).
+    println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
+    {
+        let out_dir = env::var("OUT_DIR").unwrap();
+        let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
+            let pinned = "/home/slash/cuda-12.2/bin/nvcc";
+            if std::path::Path::new(pinned).exists() { pinned.to_string() } else { "nvcc".to_string() }
+        });
+        let sm = env::var("SM_ARCH").unwrap_or_else(|_| "86".to_string());
+        let ptx = format!("{out_dir}/pom_mine.ptx");
+        let status = std::process::Command::new(&nvcc)
+            .args(["-ptx", "-O3", &format!("-arch=sm_{sm}"), "cuda/pom_mine.cu", "-o", &ptx])
+            .status()
+            .unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run: {e}"));
+        assert!(status.success(), "nvcc failed to compile cuda/pom_mine.cu");
+    }
+
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     if target_arch == "x86_64" && target_os != "windows" && target_os != "macos" {
