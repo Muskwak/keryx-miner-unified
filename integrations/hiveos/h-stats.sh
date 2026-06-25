@@ -6,7 +6,12 @@
 __MD="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
 . "$__MD/h-manifest.conf"
 
-stats_raw=`cat $CUSTOM_LOG_BASENAME.log | tr -d '\000' | grep "Current hashrate is" | tail -n 1`
+# Read the tail of the log ONCE and derive everything below from this in-memory copy, instead of
+# re-reading the whole log file once per GPU. This keeps the script cheap on big rigs (12, 20+ GPUs).
+# `tr -d '\000'` is a cheap guard in case the miner ever writes a stray NUL into the log.
+log=`tail -n 4000 "$CUSTOM_LOG_BASENAME.log" 2>/dev/null | tr -d '\000'`
+
+stats_raw=`grep "Current hashrate is" <<< "$log" | tail -n 1`
 
 maxDelay=120
 time_now=`date +%s`
@@ -21,9 +26,12 @@ diffTime=`echo $((time_now-time_rep)) | tr -d '-'`
 
 if [ "$diffTime" -lt "$maxDelay" ]; then
         # Value is second-to-last field (before unit), unit is last field.
-        # The miner logs the rate with 2 decimals, so cut+sed yields rate*1000 (e.g. 3.83 -> 3830).
+        # The miner logs the rate with 2 decimals; dropping the dot then appending one 0 yields
+        # rate*1000 (e.g. 3.83 -> "383" -> "3830"). NB: do NOT use `cut --output-delimiter=''` to
+        # drop the dot — an empty output delimiter makes cut emit a NUL byte, which then trips
+        # bash's "command substitution: ignored null byte" warning. `tr -d '.'` is clean.
         # HiveOS expects kilohashes (khs): Ghash/s = rate*1e6 khs = (rate*1000)*1e3, etc.
-        total_hashrate=`echo $stats_raw | awk 'NF>=2{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+        total_hashrate=`echo $stats_raw | awk 'NF>=2{print $(NF-1)}' | tr -d '.' | sed 's/$/0/'`
         # Force base 10: a sub-1.0 rate yields a leading zero (e.g. 0.48 -> "0480") which bash would
         # otherwise parse as octal and reject ("value too great for base").
         total_hashrate=$((10#${total_hashrate:-0}))
@@ -54,6 +62,13 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 BRAND_MINER="amd"
         fi
 
+        # The miner numbers its workers "Device #0..#K-1" over the GPUs IT enumerates (mining brand
+        # only, PCI-bus order). HiveOS's busid list can also contain devices the miner never sees —
+        # e.g. an onboard iGPU at bus 00:02.0. Using the raw loop index `i` as the miner device number
+        # then desyncs the moment such a device is skipped (every later card reads one slot too high,
+        # the last one falls off the end -> 0). Keep a SEPARATE counter that advances only for
+        # mining-brand cards, so it tracks the miner's own numbering. No iGPU -> miner_dev == i.
+        miner_dev=0
         for(( i=0; i < gpu_count; i++ )); do
                 [[ "${brands[i]}" != $BRAND_MINER ]] && continue
                 [[ "${busids[i]}" =~ ^([A-Fa-f0-9]+): ]]
@@ -63,8 +78,8 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                 # Per-device line: "... Device #N (GPU name): 5.23 Ghash/s" — the worker id is
                 # "#N (name)" so the colon is after the name, not after the number; match "#N" followed
                 # by a space or colon (never "#N:" directly, which would also break for N=1 vs N=10).
-                gpu_raw=`cat $CUSTOM_LOG_BASENAME.log | tr -d '\000' | grep -E "Device #$i[ :]" | tail -n 1`
-                hashrate=`echo $gpu_raw | awk 'NF>=2{print $(NF-1)}' | cut -d "." -f 1,2 --output-delimiter='' | sed 's/$/0/'`
+                gpu_raw=`grep -E "Device #$miner_dev[ :]" <<< "$log" | tail -n 1`
+                hashrate=`echo $gpu_raw | awk 'NF>=2{print $(NF-1)}' | tr -d '.' | sed 's/$/0/'`
                 # Force base 10 (sub-1.0 rates yield a leading zero that bash would parse as octal).
                 hashrate=$((10#${hashrate:-0}))
                 if [[ $gpu_raw == *"Thash"* ]]; then
@@ -75,6 +90,7 @@ if [ "$diffTime" -lt "$maxDelay" ]; then
                         : # Mhash/s = rate*1e3 khs = rate*1000 already, no multiplier needed
                 fi
                 hash_arr+=($hashrate)
+                miner_dev=$((miner_dev+1))
         done
 
         hash_json=`printf '%s\n' "${hash_arr[@]}" | jq -cs '.'`
