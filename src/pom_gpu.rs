@@ -179,8 +179,8 @@ impl PomGpuMiner {
 
 // Per-GPU PoM miners. Host-side WeightIndex remains shared; only the CUDA-resident worker state
 // is duplicated per device. This avoids all workers contending over a single GPU0-bound miner.
-fn miners() -> &'static Mutex<HashMap<u32, PomGpuMiner>> {
-    static MINERS: OnceLock<Mutex<HashMap<u32, PomGpuMiner>>> = OnceLock::new();
+fn miners() -> &'static Mutex<HashMap<u32, Arc<PomGpuMiner>>> {
+    static MINERS: OnceLock<Mutex<HashMap<u32, Arc<PomGpuMiner>>>> = OnceLock::new();
     MINERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -194,7 +194,7 @@ fn index_build_lock() -> &'static Mutex<()> {
 /// Install the GPU miner for a specific CUDA device.
 pub fn install(device_id: u32, m: PomGpuMiner) {
     if let Ok(mut g) = miners().lock() {
-        g.insert(device_id, m);
+        g.insert(device_id, Arc::new(m));
     }
 }
 
@@ -222,8 +222,11 @@ pub fn is_loading() -> bool {
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Option<u64> {
-    let g = miners().lock().ok()?;
-    g.get(&device_id)?.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
+    let miner = {
+        let g = miners().lock().ok()?;
+        g.get(&device_id)?.clone()
+    };
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch).ok().flatten()
 }
 
 /// Mining-tier identity for rebuilds: (model_id, gguf_path). Set once at startup.
