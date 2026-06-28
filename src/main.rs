@@ -428,6 +428,9 @@ async fn main() -> Result<(), Error> {
     } else if opt.light {
         info!("--light mode: baseline tier — mines Gemma-3-4B under PoM.");
         keryx_miner::models::Tier::Light
+    } else if opt.very_light {
+        info!("--very-light mode: smallest tier — mines Qwen3-1.7B under PoM (falls back to Gemma-3-4B before H2).");
+        keryx_miner::models::Tier::VeryLight
     } else {
         info!("default mode: mines Dolphin-8B under PoM.");
         keryx_miner::models::Tier::Default
@@ -451,7 +454,7 @@ async fn main() -> Result<(), Error> {
         specs_v2
             .iter()
             .copied()
-            .filter(|s| keryx_miner::models::pom_tier_index(&s.model_id).is_some())
+            .filter(|s| keryx_miner::models::is_pom_model(&s.model_id))
             .max_by_key(|s| s.min_vram_mb)
     } else {
         None
@@ -494,14 +497,14 @@ async fn main() -> Result<(), Error> {
     // immediately). The possession index AND the GPU walk are built by the mining loop the first
     // time PoM is active (DAA >= POM_ACTIVATION_DAA). Here we only record cheap config.
     if let Some(spec) = pom_spec {
-        let tier = keryx_miner::models::pom_tier_index(&spec.model_id).expect("pom_spec has a tier");
         let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         // Force the single-device split loader so the mining tier exposes its quant tensors for
-        // zero-dup sharing, and record the tier so the walk can be built on demand.
+        // zero-dup sharing. The PoM tier *index* is computed per block from the block DAA (it
+        // shifts at the very-light H2 hardfork), so it is not recorded here — only the model.
         keryx_miner::slm::set_pom_force_split(true);
         keryx_miner::pom_gpu::set_mining_tier(spec.model_id, gpath);
-        info!("PoM: configured for tier {} ({}); index + GPU walk load lazily when PoM activates (DAA {}).",
-            tier, spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
+        info!("PoM: configured to mine {} under possession; index + GPU walk load lazily when PoM activates (DAA {}).",
+            spec.dir_name, keryx_miner::pom::POM_ACTIVATION_DAA);
     }
 
     // Verify GPU inference works before mining. OPoI challenges are mandatory, so a miner

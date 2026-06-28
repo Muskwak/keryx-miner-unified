@@ -241,18 +241,26 @@ pub fn set_mining_tier(model_id: [u8; 32], gguf_path: String) {
 /// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
-pub fn ensure_installed(device_id: u32) -> bool {
+pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if is_installed(device_id) {
         return true;
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.fetch_add(1, Ordering::Relaxed);
-    let ok = ensure_installed_inner(device_id);
+    let ok = ensure_installed_inner(device_id, daa);
     LOADING.fetch_sub(1, Ordering::Relaxed);
     ok
 }
 
-fn ensure_installed_inner(device_id: u32) -> bool {
+/// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen at
+/// index-build time) so the tier reindexing at the very-light hardfork (H2) is applied at the
+/// exact boundary — e.g. Gemma 0→1 — rather than from a stale build-time value.
+pub fn current_tier(daa: u64) -> Option<u8> {
+    let (model_id, _) = MINING_TIER.get()?;
+    crate::models::pom_tier_index(model_id, daa)
+}
+
+fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
         None => return false,
@@ -265,7 +273,7 @@ fn ensure_installed_inner(device_id: u32) -> bool {
             Err(p) => p.into_inner(),
         };
         if crate::pom::active_index().is_none() {
-            let tier = match crate::models::pom_tier_index(model_id) {
+            let tier = match crate::models::pom_tier_index(model_id, daa) {
                 Some(t) => t,
                 None => return false,
             };

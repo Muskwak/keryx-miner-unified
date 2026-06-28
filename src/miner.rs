@@ -286,17 +286,17 @@ impl MinerManager {
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
-                        let (pph, time, target_le) = {
+                        let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
-                            (pph, time, s.target.to_le_bytes())
+                            (pph, time, s.target.to_le_bytes(), s.daa_score)
                         };
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
                         if !keryx_miner::pom_gpu::is_installed(worker_device_id) {
-                            keryx_miner::pom_gpu::ensure_installed(worker_device_id);
+                            keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
                         }
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH);
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
@@ -304,7 +304,10 @@ impl MinerManager {
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             let built = state.as_ref().and_then(|s| {
-                                keryx_miner::pom::active_index().and_then(|(idx, tier)| s.generate_block_if_pom(nonce, idx, *tier))
+                                keryx_miner::pom::active_index().and_then(|(idx, _)| {
+                                    let tier = keryx_miner::pom_gpu::current_tier(s.daa_score)?;
+                                    s.generate_block_if_pom(nonce, idx, tier)
+                                })
                             });
                             if let Some(block_seed) = built {
                                 match send_channel.blocking_send(block_seed.clone()) {
@@ -454,7 +457,10 @@ impl MinerManager {
 
                     // PoM possession path (CPU) once active; else legacy kHeavyHash.
                     let found = if state_ref.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA {
-                        keryx_miner::pom::active_index().and_then(|(idx, tier)| state_ref.generate_block_if_pom(nonce.0, idx, *tier))
+                        keryx_miner::pom::active_index().and_then(|(idx, _)| {
+                            let tier = keryx_miner::pom_gpu::current_tier(state_ref.daa_score)?;
+                            state_ref.generate_block_if_pom(nonce.0, idx, tier)
+                        })
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)
                     };
