@@ -260,6 +260,16 @@ pub fn current_tier(daa: u64) -> Option<u8> {
     crate::models::pom_tier_index(model_id, daa)
 }
 
+/// CUDA ordinal of a candle device (None if not CUDA) — used to check whether the inference
+/// engine's resident model lives on the same GPU as the PoM miner we're about to install, before
+/// sharing its tensors in place.
+fn cuda_gpu_id(d: &Device) -> Option<usize> {
+    match d.location() {
+        candle_core::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
+        _ => None,
+    }
+}
+
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let (model_id, gguf) = match MINING_TIER.get() {
         Some(x) => x,
@@ -292,7 +302,20 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     }
     // One CUDA-resident PoM worker per GPU. This avoids all workers contending for a single
     // GPU0-bound miner object while still sharing the host-side index across the process.
-    let m = PomGpuMiner::load(gguf, device_id as usize);
+    //
+    // Zero-dup on the inference GPU: if the inference engine holds THIS exact model resident on
+    // THIS device (split loader + `pom_force_split`), the walk shares its quantized tensors in
+    // place (`load_shared`) rather than loading a second full VRAM copy — saving ~one model's
+    // worth of VRAM on the serving GPU. Mining-only GPUs (no resident inference model to share)
+    // fall back to a standalone copy. The N-guard below validates the gather against the host
+    // index on every path, so a mismatch refuses to mine rather than producing bad proofs.
+    let m = match crate::slm::pom_shared(model_id) {
+        Some((inf_dev, shared)) if cuda_gpu_id(&inf_dev) == Some(device_id as usize) => {
+            info!("PoM[gpu{}]: zero-dup — sharing the inference engine's resident weights (no 2nd VRAM copy)", device_id);
+            PomGpuMiner::load_shared(gguf, &inf_dev, &shared)
+        }
+        _ => PomGpuMiner::load(gguf, device_id as usize),
+    };
     match m {
         Ok(gm) => {
             let n = gm.n_chunks();
