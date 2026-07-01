@@ -427,7 +427,9 @@ impl MinerManager {
         let mut fixed = Wrapping(0);
         std::thread::Builder::new()
             .name("cpu-miner".into())
-            .stack_size(256 * 1024)
+            // 1 MiB: well under the 2 MiB default (still a real cut on many-core hosts) but
+            // leaves ample headroom for the hashing loop (kHeavyHash matrix, PoM walk buffers).
+            .stack_size(1024 * 1024)
             .spawn(move || {
             (|| {
                 let mut state = None;
