@@ -968,6 +968,18 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// Downloaded (`.ok`) PoM model specs — the OOM-downgrade candidate set when a GPU can't hold its
+/// assigned tier. Restricting to already-downloaded models means a downgrade needs no extra prefetch
+/// (a mixed rig already pulled the smaller tiers for its smaller cards).
+pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
+    let specs = *SUPPORTED_SPECS.read().unwrap();
+    specs
+        .iter()
+        .copied()
+        .filter(|s| crate::models::is_pom_model(&s.model_id) && model_dir(s).join(".ok").exists())
+        .collect()
+}
+
 /// True only when the model is supported and its files are completely downloaded.
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
@@ -999,16 +1011,17 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
             if let Some(ref old) = *guard {
                 log::info!("SlmEngine: evicting '{}' to load '{}'", old.name, spec.name);
             }
-            // Inference has priority over PoW: release the GPU miner's hold on the resident mining
-            // weights on this device only, so this model fits. Mining rebuilds (reloads its model)
-            // when it next runs on this device. `0` matches the CUDA device inference always loads
-            // onto below (`Device::new_cuda(0)`); other devices' resident miners are left alone.
-            crate::pom_gpu::uninstall(0);
+            // Route inference to the device that MINES this model (per-GPU tier assignment): only
+            // that GPU pauses PoW and the walk can share the resident weights (zero-dup). Inference
+            // has priority, so we release that device's miner to make room; it rebuilds (reloads its
+            // model) when it next runs. Falls back to device 0 (single-GPU / unassigned model).
+            let dev_id = crate::pom_gpu::device_for_model(model_id).unwrap_or(0);
+            crate::pom_gpu::uninstall(dev_id);
             *guard = None;
-            let device = match Device::new_cuda(0) {
-                Ok(d) => { log::info!("SlmEngine: CUDA device 0 active"); d }
+            let device = match Device::new_cuda(dev_id as usize) {
+                Ok(d) => { log::info!("SlmEngine: CUDA device {} active", dev_id); d }
                 Err(e) => {
-                    log::error!("SlmEngine: CUDA device unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+                    log::error!("SlmEngine: CUDA device {} unavailable ({e}) — inference is GPU-only, cannot load '{}'", dev_id, spec.name);
                     return None;
                 }
             };
@@ -1071,11 +1084,13 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
     if guard.as_ref().map_or(false, |e| &e.model_id == model_id) {
         return true; // already resident
     }
+    // Load on the model's mining device (zero-dup colocation), device 0 fallback.
+    let dev_id = crate::pom_gpu::device_for_model(model_id).unwrap_or(0);
     *guard = None;
-    let device = match Device::new_cuda(0) {
+    let device = match Device::new_cuda(dev_id as usize) {
         Ok(d) => d,
         Err(e) => {
-            log::error!("SlmEngine: ensure_loaded CUDA unavailable ({e}) — inference is GPU-only, cannot load '{}'", spec.name);
+            log::error!("SlmEngine: ensure_loaded CUDA {} unavailable ({e}) — cannot load '{}'", dev_id, spec.name);
             return false;
         }
     };
