@@ -235,7 +235,14 @@ impl CudaDevice {
         }
         drop(ms);
         let mut ms = self.modules.write().unwrap();
-        let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
+        // `mdl.ptx()` is a multi-arch fatbin (see candle-kernels/build.rs), not PTX source text —
+        // `Ptx::from_binary` (not the blanket `From<S: Into<String>>` a `.into()` would reach for)
+        // so `cuModuleLoadData` gets the raw fatbin bytes unchanged. The driver picks the best
+        // embedded arch for the actual device transparently; no per-arch dispatch needed here.
+        let cuda_module = self
+            .context
+            .load_module(cudarc::nvrtc::Ptx::from_binary(mdl.ptx().to_vec()))
+            .w()?;
         ms.mdls[mdl.index()] = Some(cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
         Ok(CudaFunc {

@@ -195,15 +195,16 @@ impl State {
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
 
-        let seed = pom::pom_block_seed(&pph, timestamp, nonce);
+        let seed = pom::pom_block_seed_for_daa(&pph, self.daa_score, timestamp, nonce);
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o));
-        if !pom::le_leq(&pom::pom_pow_value(final_state, &pph), &self.target.to_le_bytes()) {
+        if !pom::le_leq(&pom::pom_pow_value_for_daa(final_state, &pph, self.daa_score), &self.target.to_le_bytes()) {
             return None;
         }
 
         let proof = pom::build_proof(
             tier,
             &pph,
+            self.daa_score,
             nonce,
             seed,
             index.n_chunks,
@@ -219,6 +220,12 @@ impl State {
             BlockSeed::FullBlock(ref mut block) => {
                 let header = block.header.as_mut().expect("We checked that a header exists on creation");
                 header.nonce = nonce;
+                // H3: the header commits to the walk's final state (block level + header-only
+                // PoW check derive from it) — the node pins `proof.final_state == header.pom_final_state`.
+                // 0/absent pre-H3 (node ignores the field until `pom_level_activation`).
+                if pom::is_h3(self.daa_score) {
+                    header.pom_final_state = final_state;
+                }
                 block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
             }
             // Pool share: carry the proof bytes so the stratum client hex-encodes

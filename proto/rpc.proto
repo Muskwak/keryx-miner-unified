@@ -43,6 +43,11 @@ message RpcBlockHeader {
   string blueWork = 10;
   string pruningPoint = 14;
   uint64 blueScore = 13;
+  // H3 (pom_level_activation): final state of the winning PoM possession walk, committed
+  // into the block hash. Miners MUST fill it on submit_block (from the walk that solved
+  // the block), exactly like nonce. 0 (absent) for pre-fork blocks. Field number MUST match
+  // the node's RpcBlockHeader.pomFinalState (16).
+  uint64 pomFinalState = 16;
 }
 
 message RpcBlockLevelParents {

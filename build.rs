@@ -66,12 +66,16 @@ fn build_cuda_ptx(out_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     let nvcc = find_nvcc();
 
     // Compile PTX for all major NVIDIA compute capabilities: Pascal (61), Volta (70), Turing (75),
-    // Ampere (80/86), Ada (89), Hopper (90). Every arch is compiled from the SAME tuned
-    // cuda/pom_mine.cu, so sm_61 (P40/1070) keeps its full tuning while newer GPUs get native PTX.
+    // Ampere (80/86), Ada (89), Hopper (90), Blackwell (100 datacenter B100/B200, 120 consumer
+    // RTX 50-series). Every arch is compiled from the SAME tuned cuda/pom_mine.cu, so sm_61
+    // (P40/1070) keeps its full tuning while newer GPUs get native PTX. Blackwell needs nvcc
+    // 12.8+ (the first CUDA 12.x release recognizing sm_100/sm_120) — no separate toolchain or
+    // prebuilt fatbin required, unlike forks that pin an older nvcc and paper over the gap with a
+    // manually-rebuilt binary blob.
     let archs = [
         ("61", "PomMinerSm61"), ("70", "PomMinerSm70"), ("75", "PomMinerSm75"),
         ("80", "PomMinerSm80"), ("86", "PomMinerSm86"), ("89", "PomMinerSm89"),
-        ("90", "PomMinerSm90"),
+        ("90", "PomMinerSm90"), ("100", "PomMinerSm100"), ("120", "PomMinerSm120"),
     ];
 
     for (arch, _name) in &archs {
@@ -95,11 +99,14 @@ fn build_cuda_ptx(out_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Generate the per-arch selector module included by src/pom_gpu.rs.
+    // Generate the per-arch selector module included by src/pom_gpu.rs. Compute capability
+    // major.minor is the arch string split before its LAST digit (sm_61 -> 6.1, sm_100 -> 10.0,
+    // sm_120 -> 12.0) — NOT simply its first two characters, which breaks for 3-digit archs like
+    // Blackwell's 100/120 (would misparse sm_100 as compute 1.0).
     let mut match_arms = String::new();
     for (arch, _name) in &archs {
-        let major = arch.chars().next().unwrap();
-        let minor = arch.chars().nth(1).unwrap();
+        let split_at = arch.len() - 1;
+        let (major, minor) = (&arch[..split_at], &arch[split_at..]);
         match_arms.push_str(&format!(
             "        ({}, {}) => include_str!(concat!(env!(\"OUT_DIR\"), \"/pom_mine_sm{}.ptx\")),\n",
             major, minor, arch

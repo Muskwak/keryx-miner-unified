@@ -34,7 +34,9 @@ pub const ALL_IDS: [Id; 11] = [
 
 pub struct Module {
     index: usize,
-    ptx: &'static str,
+    /// A multi-arch fatbin (built by `build.rs`), not raw PTX text — `cuModuleLoadData` accepts
+    /// either transparently, so callers just need `Ptx::from_binary` instead of `Ptx::from_src`.
+    ptx: &'static [u8],
 }
 
 impl Module {
@@ -42,7 +44,7 @@ impl Module {
         self.index
     }
 
-    pub fn ptx(&self) -> &'static str {
+    pub fn ptx(&self) -> &'static [u8] {
         self.ptx
     }
 }

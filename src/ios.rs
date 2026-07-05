@@ -874,6 +874,7 @@ fn mining_worker(
 
         let mut pph = [0u8; 32];
         pph.copy_from_slice(&s.pow_hash_header[..32]);
+        pom::salt_pph_bytes_for_daa(&mut pph, s.daa_score);
         let timestamp = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
         let target_le = s.target.to_le_bytes();
 

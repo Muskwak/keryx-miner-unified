@@ -321,6 +321,10 @@ impl MinerManager {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                            // H3: the GPU kernel only ever folds pph into the seed+pow-value (never
+                            // Fiat-Shamir challenges), so salting the raw hash here is byte-identical
+                            // to a per-kernel salted fold, with zero CUDA/Vulkan/Metal changes needed.
+                            keryx_miner::pom::salt_pph_bytes_for_daa(&mut pph, s.daa_score);
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
                             (pph, time, s.target.to_le_bytes(), s.daa_score)
                         };
@@ -490,6 +494,7 @@ impl MinerManager {
                         let s = state.as_ref().unwrap();
                         let mut pph = [0u8; 32];
                         pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                        keryx_miner::pom::salt_pph_bytes_for_daa(&mut pph, s.daa_score);
                         let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
                         (pph, time, s.target.to_le_bytes(), s.daa_score)
                     };

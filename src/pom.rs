@@ -156,10 +156,47 @@ fn pph_words(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
     w
 }
 
-/// Canonical block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
-/// BYTE-IDENTICAL to `pom_mine.cu::pom_seed_fold` and the node's `pom_block_seed`.
-pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
-    let p = pph_words(pre_pow_hash);
+/// H3 domain salt applied to the pph words feeding both PoM folds at/after
+/// `POM_LEVEL_ACTIVATION_DAA`. BYTE-IDENTICAL to the node's `POM_H3_PPH_SALT`
+/// (`consensus/core/src/pom.rs`) — forced update: every walk trajectory and pow value changes
+/// at the gate, so pre-H3 binaries produce proofs that verify false.
+pub const POM_H3_PPH_SALT: [u64; 4] = [0x7C99D381176D4EC4, 0xC2E28E3E28118C36, 0xD496CE1B129B76CA, 0x47CF0979FA580BCE];
+
+#[inline]
+fn pph_words_h3(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = pph_words(pre_pow_hash);
+    for (wi, si) in w.iter_mut().zip(POM_H3_PPH_SALT.iter()) {
+        *wi ^= si;
+    }
+    w
+}
+
+/// True at/after the H3 (PoM block-level) hardfork — MUST match the node's `pom_level_activation`.
+#[inline]
+pub fn is_h3(daa_score: u64) -> bool {
+    daa_score >= POM_LEVEL_ACTIVATION_DAA
+}
+
+/// XOR `POM_H3_PPH_SALT` into a raw pre_pow_hash's bytes when `daa_score` is post-H3, in place.
+/// Since `pph_words` is a plain little-endian byte reinterpretation (no hashing in between),
+/// XOR-ing the salt into the hash bytes directly is byte-identical to XOR-ing it into the words
+/// afterward. This lets the GPU kernels (CUDA/Vulkan/Metal), which only ever consume pph for the
+/// seed+pow folds (never for Fiat-Shamir challenges), take the salt with ZERO kernel/shader
+/// changes — the host just salts the hash before handing it to the existing `mine()` entry point.
+pub fn salt_pph_bytes_for_daa(pph: &mut [u8; 32], daa_score: u64) {
+    if !is_h3(daa_score) {
+        return;
+    }
+    for (i, sw) in POM_H3_PPH_SALT.iter().enumerate() {
+        let sb = sw.to_le_bytes();
+        for j in 0..8 {
+            pph[i * 8 + j] ^= sb[j];
+        }
+    }
+}
+
+#[inline]
+fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
     let mut s = mix64(nonce ^ 0x4B65727978531);
     s = mix64(s ^ timestamp);
     s = mix64(s ^ p[0]);
@@ -169,10 +206,28 @@ pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u6
     s
 }
 
-/// Canonical pow value (256-bit LE) = mix64-fold of (final_state, pre_pow_hash).
-/// BYTE-IDENTICAL to `pom_mine.cu::pom_pow_fold` and the node's `pom_pow_value`.
-pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
-    let p = pph_words(pre_pow_hash);
+/// Canonical block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
+/// Pre-H3 era only. BYTE-IDENTICAL to `pom_mine.cu::pom_seed_fold` and the node's `pom_block_seed`.
+pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words(pre_pow_hash), timestamp, nonce)
+}
+
+/// H3-era block seed: same fold over the salted pph words.
+pub fn pom_block_seed_h3(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words_h3(pre_pow_hash), timestamp, nonce)
+}
+
+/// Dispatch on `daa_score` — MUST match the node's H3 gate (`pom_level_activation`).
+pub fn pom_block_seed_for_daa(pre_pow_hash: &[u8; 32], daa_score: u64, timestamp: u64, nonce: u64) -> u64 {
+    if is_h3(daa_score) {
+        pom_block_seed_h3(pre_pow_hash, timestamp, nonce)
+    } else {
+        pom_block_seed(pre_pow_hash, timestamp, nonce)
+    }
+}
+
+#[inline]
+fn pom_pow_value_from_words(final_state: u64, p: &[u64; 4]) -> [u8; 32] {
     let o0 = mix64(final_state ^ p[0] ^ 0x9E3779B97F4A7C15);
     let o1 = mix64(o0 ^ p[1] ^ 0xC2B2AE3D27D4EB4F);
     let o2 = mix64(o1 ^ p[2] ^ 0x165667B19E3779F9);
@@ -183,6 +238,26 @@ pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
     out[16..24].copy_from_slice(&o2.to_le_bytes());
     out[24..32].copy_from_slice(&o3.to_le_bytes());
     out
+}
+
+/// Canonical pow value (256-bit LE) = mix64-fold of (final_state, pre_pow_hash).
+/// Pre-H3 era only. BYTE-IDENTICAL to `pom_mine.cu::pom_pow_fold` and the node's `pom_pow_value`.
+pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    pom_pow_value_from_words(final_state, &pph_words(pre_pow_hash))
+}
+
+/// H3-era pow value: same fold over the salted pph words.
+pub fn pom_pow_value_h3(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    pom_pow_value_from_words(final_state, &pph_words_h3(pre_pow_hash))
+}
+
+/// Dispatch on `daa_score` — MUST match the node's H3 gate (`pom_level_activation`).
+pub fn pom_pow_value_for_daa(final_state: u64, pre_pow_hash: &[u8; 32], daa_score: u64) -> [u8; 32] {
+    if is_h3(daa_score) {
+        pom_pow_value_h3(final_state, pre_pow_hash)
+    } else {
+        pom_pow_value(final_state, pre_pow_hash)
+    }
 }
 
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
@@ -273,6 +348,7 @@ pub fn mine_pom(
     index: &WeightIndex,
     tier: u8,
     pre_pow_hash: &[u8; 32],
+    daa_score: u64,
     timestamp: u64,
     target: &[u8; 32],
     k: u32,
@@ -281,10 +357,11 @@ pub fn mine_pom(
     max_nonces: u64,
 ) -> Option<(u64, PomProof)> {
     for nonce in nonce_start..nonce_start.saturating_add(max_nonces) {
-        let seed = pom_block_seed(pre_pow_hash, timestamp, nonce);
+        let seed = pom_block_seed_for_daa(pre_pow_hash, daa_score, timestamp, nonce);
         let final_state = walk_final(seed, index.n_chunks, k, |o| index.read_chunk(o));
-        if le_leq(&pom_pow_value(final_state, pre_pow_hash), target) {
-            let proof = build_proof(tier, pre_pow_hash, nonce, seed, index.n_chunks, k, t, |o| index.read_chunk(o), |o| index.merkle_path(o));
+        if le_leq(&pom_pow_value_for_daa(final_state, pre_pow_hash, daa_score), target) {
+            let proof =
+                build_proof(tier, pre_pow_hash, daa_score, nonce, seed, index.n_chunks, k, t, |o| index.read_chunk(o), |o| index.merkle_path(o));
             return Some((nonce, proof));
         }
     }
@@ -299,6 +376,7 @@ pub fn mine_pom(
 pub fn build_proof<F, WP>(
     tier: u8,
     pre_pow_hash: &[u8; 32],
+    daa_score: u64,
     nonce: u64,
     seed: u64,
     n_chunks: u64,
@@ -323,7 +401,9 @@ where
     let trace_leaves: Vec<[u8; 32]> = trace.iter().map(|&s| trace_leaf(s)).collect();
     let trace_root = merkle_root(&trace_leaves);
     let final_state = trace[k as usize];
-    let pow_value = pom_pow_value(final_state, pre_pow_hash);
+    // Pow-value gets the H3 salt when active; the Fiat-Shamir challenges below still hash the
+    // RAW pre_pow_hash (only the two mix64 folds are salted, matching the node exactly).
+    let pow_value = pom_pow_value_for_daa(final_state, pre_pow_hash, daa_score);
 
     let chs = challenges(pre_pow_hash, nonce, &trace_root, &pow_value, t, k);
     let openings = chs
@@ -356,11 +436,22 @@ where
 /// Self-check a built proof before submit (same logic the node runs). Cheap insurance
 /// against emitting a block the node will reject.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_proof(pre_pow_hash: &[u8; 32], nonce: u64, seed: u64, proof: &PomProof, n_chunks: u64, k: u32, t: usize, r_t: &[u8; 32], target: &[u8; 32]) -> bool {
+pub fn verify_proof(
+    pre_pow_hash: &[u8; 32],
+    daa_score: u64,
+    nonce: u64,
+    seed: u64,
+    proof: &PomProof,
+    n_chunks: u64,
+    k: u32,
+    t: usize,
+    r_t: &[u8; 32],
+    target: &[u8; 32],
+) -> bool {
     if proof.openings.len() != t {
         return false;
     }
-    if pom_pow_value(proof.final_state, pre_pow_hash) != proof.pow_value {
+    if pom_pow_value_for_daa(proof.final_state, pre_pow_hash, daa_score) != proof.pow_value {
         return false;
     }
     if !le_leq(&proof.pow_value, target) {
@@ -916,6 +1007,12 @@ fn finalize_checkpoint_upper(
 /// MAINNET_PARAMS.pom_activation = new(37_780_000).
 pub const POM_ACTIVATION_DAA: u64 = 37_780_000;
 
+/// PoM block-level hardfork (H3) activation DAA score — MUST equal the node's
+/// `MAINNET_PARAMS.pom_level_activation`. Salts the pph words feeding both PoM folds
+/// (`POM_H3_PPH_SALT`, a forced update: pre-H3 binaries produce proofs that verify false) and
+/// requires the winning block's header to carry `pom_final_state` (see `pow.rs::generate_block_if_pom`).
+pub const POM_LEVEL_ACTIVATION_DAA: u64 = 43_450_000;
+
 /// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
 /// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
 /// process-wide slot. Each tier's index is built once and shared (`Arc`) across every GPU on it.
@@ -1115,9 +1212,9 @@ mod tests {
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [7u8; 32];
         let target = [0xffu8; 32];
-        let (nonce, proof) = mine_pom(&idx, 2, &pph, 123, &target, k, t, 0, 1).expect("max target → win");
+        let (nonce, proof) = mine_pom(&idx, 2, &pph, 0, 123, &target, k, t, 0, 1).expect("max target → win");
         let seed = pom_block_seed(&pph, 123, nonce);
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
+        assert!(verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
 
         let _ = std::fs::remove_file(&gguf_path);
     }
@@ -1139,10 +1236,10 @@ mod tests {
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [3u8; 32];
         let target = [0xffu8; 32]; // max → the first nonce wins, so 1 nonce suffices
-        let (nonce, proof) = mine_pom(&idx, 0, &pph, 99, &target, k, t, 0, 1).expect("max target → win");
+        let (nonce, proof) = mine_pom(&idx, 0, &pph, 0, 99, &target, k, t, 0, 1).expect("max target → win");
         let seed = pom_block_seed(&pph, 99, nonce);
         assert!(
-            verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target),
+            verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target),
             "GGUF-pread chunks must verify against the model's R_T (byte-identity broken otherwise)"
         );
     }
@@ -1199,6 +1296,75 @@ mod tests {
     }
 
     #[test]
+    fn h3_salt_constant_matches_sha256_derivation() {
+        // POM_H3_PPH_SALT must equal sha256("keryx-h3-pom-pph-salt") read as 4 LE u64 words —
+        // the node's documented derivation, independently verified in Python during review.
+        // Pinned here as a regression guard against a hardcoded-hex-literal transcription bug,
+        // which would silently desync every post-H3 proof from the node's verifier.
+        let expected: [u64; 4] = [
+            0x7C99D381176D4EC4,
+            0xC2E28E3E28118C36,
+            0xD496CE1B129B76CA,
+            0x47CF0979FA580BCE,
+        ];
+        assert_eq!(POM_H3_PPH_SALT, expected);
+    }
+
+    #[test]
+    fn h3_salt_changes_seed_and_pow_value() {
+        // Sanity: the H3 fold must actually differ from the pre-H3 fold for the same inputs —
+        // an accidental no-op salt (e.g. all-zero) would silently pass every other test.
+        let pph = blake(b"h3-pph");
+        let (ts, nonce, final_state) = (12345u64, 99u64, 0xDEADBEEFu64);
+        assert_ne!(pom_block_seed(&pph, ts, nonce), pom_block_seed_h3(&pph, ts, nonce));
+        assert_ne!(pom_pow_value(final_state, &pph), pom_pow_value_h3(final_state, &pph));
+
+        // Dispatch: below activation uses the unsalted fold, at/after uses the salted one.
+        assert_eq!(pom_block_seed_for_daa(&pph, POM_LEVEL_ACTIVATION_DAA - 1, ts, nonce), pom_block_seed(&pph, ts, nonce));
+        assert_eq!(pom_block_seed_for_daa(&pph, POM_LEVEL_ACTIVATION_DAA, ts, nonce), pom_block_seed_h3(&pph, ts, nonce));
+        assert_eq!(
+            pom_pow_value_for_daa(final_state, &pph, POM_LEVEL_ACTIVATION_DAA - 1),
+            pom_pow_value(final_state, &pph)
+        );
+        assert_eq!(pom_pow_value_for_daa(final_state, &pph, POM_LEVEL_ACTIVATION_DAA), pom_pow_value_h3(final_state, &pph));
+    }
+
+    #[test]
+    fn h3_salted_bytes_equal_salted_words() {
+        // `salt_pph_bytes_for_daa` (used on the GPU host-dispatch paths) must be byte-identical
+        // to salting the words directly (used on the CPU proof-build path) — the whole point of
+        // feeding GPU kernels a pre-salted raw hash instead of touching kernel/shader code.
+        let pph = blake(b"gpu-vs-cpu-pph");
+        let mut salted_bytes = pph;
+        salt_pph_bytes_for_daa(&mut salted_bytes, POM_LEVEL_ACTIVATION_DAA);
+        let (ts, nonce) = (777u64, 55u64);
+        assert_eq!(pom_block_seed(&salted_bytes, ts, nonce), pom_block_seed_h3(&pph, ts, nonce));
+        assert_eq!(pom_pow_value(0xABCD, &salted_bytes), pom_pow_value_h3(0xABCD, &pph));
+
+        // Below activation, salting is a no-op.
+        let mut unsalted_bytes = pph;
+        salt_pph_bytes_for_daa(&mut unsalted_bytes, POM_LEVEL_ACTIVATION_DAA - 1);
+        assert_eq!(unsalted_bytes, pph);
+    }
+
+    #[test]
+    fn h3_build_then_self_verify() {
+        // End-to-end proof build+verify at a post-H3 DAA score, mirroring build_then_self_verify.
+        let (k, t) = (256u32, 32usize);
+        let idx = synth_index(4096);
+        let pph = blake(b"h3-e2e-pph");
+        let nonce = 0xabc;
+        let daa = POM_LEVEL_ACTIVATION_DAA + 1000;
+        let seed = pom_block_seed_for_daa(&pph, daa, 111, nonce);
+
+        let proof = build_proof(2, &pph, daa, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        assert!(verify_proof(&pph, daa, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
+        // A pre-H3 verifier (wrong daa_score) must NOT accept a post-H3 proof — confirms the
+        // salt actually participates in `pow_value` and isn't silently ignored.
+        assert!(!verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
+    }
+
+    #[test]
     fn build_then_self_verify() {
         let (k, t) = (256u32, 32usize);
         let idx = synth_index(4096);
@@ -1207,12 +1373,12 @@ mod tests {
         let seed = pom_block_seed(&pph, 111, nonce);
 
         let proof =
-            build_proof(2, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
+            build_proof(2, &pph, 0, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        assert!(verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
         // borsh wire-format round-trips (same encoding the node decodes).
         let bytes = borsh::to_vec(&proof).unwrap();
         let back: PomProof = borsh::from_slice(&bytes).unwrap();
-        assert!(verify_proof(&pph, nonce, seed, &back, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
+        assert!(verify_proof(&pph, 0, nonce, seed, &back, idx.n_chunks, k, t, &idx.r_t, &[0xff; 32]));
         assert_eq!(back.tier, 2);
     }
 
@@ -1224,13 +1390,13 @@ mod tests {
         let nonce = 7;
         let seed = pom_block_seed(&pph, 1, nonce);
         let proof =
-            build_proof(0, &pph, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+            build_proof(0, &pph, 0, nonce, seed, idx.n_chunks, k, t, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
         assert!(
-            !verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0u8; 32]),
+            !verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &[0u8; 32]),
             "zero target must fail"
         );
         assert!(
-            !verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &blake(b"wrong"), &[0xff; 32]),
+            !verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, k, t, &blake(b"wrong"), &[0xff; 32]),
             "wrong R_T must fail"
         );
     }
@@ -1244,10 +1410,10 @@ mod tests {
         // Target requiring pow_value MSB <= 0x10 (~6.6% of nonces) — found within a few tries.
         let mut target = [0xffu8; 32];
         target[31] = 0x10;
-        let (nonce, proof) = mine_pom(&idx, 1, &pph, ts, &target, k, t, 0, 100_000).expect("mine a nonce");
+        let (nonce, proof) = mine_pom(&idx, 1, &pph, 0, ts, &target, k, t, 0, 100_000).expect("mine a nonce");
         let seed = pom_block_seed(&pph, ts, nonce);
         // The proof verifies against the same target the node would use.
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
+        assert!(verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target));
         assert_eq!(proof.tier, 1);
     }
 
@@ -1270,7 +1436,7 @@ mod tests {
         let nonce = 1234;
         let seed = pom_block_seed(&pph, 99, nonce);
         let proof =
-            build_proof(0, &pph, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
-        assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32]));
+            build_proof(0, &pph, 0, nonce, seed, idx.n_chunks, 256, 32, |o| idx.read_chunk(o), |o| idx.merkle_path(o));
+        assert!(verify_proof(&pph, 0, nonce, seed, &proof, idx.n_chunks, 256, 32, &idx.r_t, &[0xff; 32]));
     }
 }
