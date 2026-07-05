@@ -251,10 +251,19 @@ impl PomWalkGpu {
     /// and skips the rest.
     pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u32) -> Option<u64> {
         let mut done: u32 = 0;
+        // The two shader variants have DIFFERENT local_size_x: the native uint64 shader uses 256
+        // (tuned for 8×32-wide wavefronts on RDNA2), the shaderInt64-less emulated shader uses 64
+        // (a portable default — see pom_walk_i32.comp's comment). The host's dispatch group count
+        // MUST divide the batch by the shader's own workgroup size, or it dispatches the wrong
+        // number of threads: e.g. dividing by 256 when the i32 shader is 64-wide dispatches only
+        // 1/4 as many threads, silently leaving 75% of nonces unexamined (no crash, just missed
+        // blocks). Both shaders key off gl_GlobalInvocationID.x, so the global thread count must
+        // be >= batch on either path.
+        let local_size_x: u32 = if self.use_i32 { 64 } else { 256 };
         while done < batch {
             let sub = (batch - done).min(MAX_DISPATCH_NONCES);
             self.vk.write_buffer(&self.winner, &NO_WINNER.to_le_bytes());
-            let groups = sub.div_ceil(256); // local_size_x = 256
+            let groups = sub.div_ceil(local_size_x);
             if self.use_i32 {
                 // shaderInt64-less emulated variant: pack 64-bit values as [u32;2] (lo, hi) pairs.
                 let pp = words4(pre_pow_hash);
