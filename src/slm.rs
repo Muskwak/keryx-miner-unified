@@ -346,17 +346,23 @@ fn stop_config(tokenizer: &Tokenizer, name: &str) -> (Vec<u32>, Vec<&'static str
                 &[1]),
             vec!["<end_of_turn>", "<start_of_turn>"],
         ),
-        // Llama-3.3-70B-Instruct (abliterated) — LLaMA-3 header template. Stop on
-        // the official `eos_token_id` set for 3.3 Instruct:
-        //   128009 = <|eot_id|> (end of turn), 128001 = <|end_of_text|> (base EOS),
-        //   128008 = <|eom_id|> (end of message, tool turns).
-        // Both the abliterated (v2) and the genuine official (v1) Llama-3.3-70B share
-        // the LLaMA-3 header template and terminators.
-        "llama-3.3-70b" | "llama-3.3-70b-official" => (
+        // Llama-3.3-70B (abliterated / uncensored) — re-templated to ChatML. The vocab is
+        // still stock LLaMA-3, so <|im_end|>/<|im_start|> are NOT atomic tokens: the model
+        // writes "<|im_end|>" as plain multi-token text and never emits <|eot_id|> (128009).
+        // Neither the id set nor an <|eot_id|> stop-string ever fires — only a stop-STRING on
+        // the ChatML markers cuts the turn (and truncates the trailing marker from the output).
+        // Without it the model completes its turn, prints the marker, opens `assistant`, and
+        // loops the same answer until max_tokens.
+        "llama-3.3-70b" => (
+            collect_stop_ids(tokenizer, &["<|eot_id|>", "<|end_of_text|>"], &[128009, 128001]),
+            vec!["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|end_of_text|>"],
+        ),
+        // Genuine official Llama-3.3-70B-Instruct — LLaMA-3 header template. Stop on the
+        // official `eos_token_id` set: 128009 <|eot_id|>, 128001 <|end_of_text|>, 128008 <|eom_id|>.
+        "llama-3.3-70b-official" => (
             collect_stop_ids(tokenizer,
                 &["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"],
                 &[128009, 128001, 128008]),
-            // Cut if the model tries to open a fresh turn instead of stopping.
             vec!["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"],
         ),
         // Qwen3-32B — ChatML template:
