@@ -107,6 +107,24 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
+      # Catches the "-force_load missing" class of regression (ios-app/project.yml's
+      # OTHER_LDFLAGS): without it, the linker only pulls object files from libkeryx_miner.a that
+      # are directly symbol-referenced, which the Swift/ObjC bridging header doesn't trigger for
+      # most of the Rust code — the app builds and archives successfully but the executable ends
+      # up a tiny stub (~20-30 KB) with none of the miner logic linked in. A real build is tens of
+      # MB (dominated by the static-linked Rust std + dependencies).
+      - name: Sanity-check app executable size
+        run: |
+          exe="ios-app/build/keryx-ios.xcarchive/Products/Applications/keryx-ios.app/keryx-ios"
+          size=$(stat -f%z "$exe")
+          echo "keryx-ios executable size: $size bytes"
+          if [ "$size" -lt 1000000 ]; then
+            echo "::error::keryx-ios executable is only $size bytes -- the Rust static library" \
+                 "almost certainly didn't get linked in (check OTHER_LDFLAGS -force_load in" \
+                 "ios-app/project.yml)."
+            exit 1
+          fi
+
       - name: Create unsigned .ipa
         run: |
           cd ios-app

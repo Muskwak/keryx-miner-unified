@@ -245,6 +245,18 @@ all now fixed:
    --features cuda,vulkan` pass in this document didn't catch it. Fixed by passing `-Xcompiler
    /MD` to the `moe_builder` in `vendor/candle-kernels/build.rs` (Windows-only branch, alongside
    the existing `-D_USE_MATH_DEFINES`) so nvcc's host-compiled objects match everything else.
+5. **`ios-app/project.yml` was missing `-force_load` on `OTHER_LDFLAGS`**, so the iOS app linked
+   but silently didn't pull the Rust code into the final executable — Xcode's linker only includes
+   object files from a static library that are directly symbol-referenced, and the Swift/ObjC
+   bridging header's FFI calls don't trigger that for most of `libkeryx_miner.a`. Symptom: the
+   build/CI run reports success but the app's executable is a ~20-30 KB stub instead of tens of
+   MB. `keryx-metal` hit and fixed this exact bug (commit `675a297`, "ci: add verification step
+   and force_load for iOS static library linking") but it never got carried into this repo when
+   `ios-app/` was copied over — same category of loss as fixes 1–3 above. Ported the
+   `-force_load $(SRCROOT)/../target/aarch64-apple-ios/release/libkeryx_miner.a` flag verbatim, and
+   added a CI step (`build-apple.yml`, "Sanity-check app executable size") that fails the build if
+   the archived executable is under 1 MB, so this regression class fails loudly instead of
+   producing a silently-broken app.
 
 Also removed an unused `use std::sync::Arc;` in `inference_engine.rs`.
 
