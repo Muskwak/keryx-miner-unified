@@ -31,7 +31,11 @@ mod pow;
 mod target;
 mod watch;
 
-const WHITELIST: [&str; 4] = ["libkeryxcuda", "libkeryxopencl", "keryxcuda", "keryxopencl"];
+// PoM mining is CUDA-only (the walk kernel is CUDA). The OpenCL/AMD plugin did legacy
+// kHeavyHash only — it cannot produce a possession proof, so an OpenCL worker's blocks are
+// rejected post-PoM. It is no longer loaded (dropping its dead --opencl-*/--experimental-amd
+// flags with it). AMD PoM lives in Muskwak's Vulkan fork.
+const WHITELIST: [&str; 2] = ["libkeryxcuda", "keryxcuda"];
 
 pub mod proto {
     #![allow(clippy::derive_partial_eq_without_eq)]
