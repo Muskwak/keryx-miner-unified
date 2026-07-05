@@ -8,7 +8,7 @@
 # SDK / shaderc -- see https://vulkan.lunarg.com/, or the LunarG apt repo), and libclang (for the
 # llama.cpp FFI bindgen step). Unlike Windows, Linux does NOT need CMAKE_GENERATOR=Ninja -- the
 # default Makefiles generator builds llama.cpp's vulkan-shaders-gen subproject fine here (a
-# Windows-only MAX_PATH/ExternalProject quirk -- see IMPLEMENTATION_NOTES.md).
+# Windows-only MAX_PATH/ExternalProject quirk).
 #
 # Usage:
 #   ./build-linux.sh                 # auto-detect, build the best available feature set

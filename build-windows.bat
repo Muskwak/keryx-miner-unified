@@ -8,7 +8,7 @@ REM   - LLVM (libclang.dll, for the llama.cpp FFI bindgen step) -- set LIBCLANG_
 REM     script auto-detects a few common install locations.
 REM   - Ninja on PATH -- the default Visual Studio CMake generator fails to build llama.cpp's
 REM     vulkan-shaders-gen subproject on Windows (a Windows MAX_PATH / ExternalProject quirk);
-REM     Ninja avoids it. See IMPLEMENTATION_NOTES.md for details.
+REM     Ninja avoids it.
 REM   - cmake and the Vulkan SDK (glslc) on PATH.
 REM
 REM Run it from anywhere; it cd's to its own directory first.
@@ -85,8 +85,7 @@ REM     (target\release\build\llama-cpp-sys-2-<hash>\out\build\ggml\...\vulkan-s
 REM     CMakeFiles\CMakeScratch\TryCompile-<id>\testCXXCompiler.cxx) to blow past Windows'
 REM     260-char MAX_PATH under a plain `target\release` -- cl.exe fails with
 REM     "fatal error C1083: Cannot open compiler generated file: ''". Use a short
-REM     CARGO_TARGET_DIR to dodge it, unless the caller already set one. See
-REM     IMPLEMENTATION_NOTES.md for the full diagnosis. ---
+REM     CARGO_TARGET_DIR to dodge it, unless the caller already set one. ---
 echo !FEATURES! | findstr /C:"vulkan" >nul
 if not errorlevel 1 (
     if not defined CARGO_TARGET_DIR (
