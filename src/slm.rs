@@ -1178,6 +1178,12 @@ pub fn pom_shared(
         ModelInner::QuantizedQwen3Split(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         ModelInner::QuantizedSplit(m) => Some((e.device.clone(), m.pom_quant_tensors())),
+        // Gemma-3-4B (baseline --light tier): candle's quantized_gemma3 keeps its weight fields
+        // private, so the vendored copy adds `pom_quant_tensors()` (see [patch.crates-io] in
+        // Cargo.toml). Sharing these lets the PoM walk reuse the inference engine's resident Gemma
+        // weights instead of loading a duplicate ~2GB copy — critical on 6-8GB cards where the dup
+        // blows VRAM and pages over PCIe. Without this, --light silently double-loads Gemma.
+        ModelInner::QuantizedGemma3(m) => Some((e.device.clone(), m.pom_quant_tensors())),
         _ => None,
     }
 }

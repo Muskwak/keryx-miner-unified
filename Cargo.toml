@@ -211,6 +211,15 @@ default-members = ["."]
 #     the miner can build a bindless pointer table over the existing buffers
 #     and skip the copy. Linux/Windows CUDA builds keep the crates.io copy —
 #     cargo will emit a harmless "patch not used" warning there.
+#   * candle-transformers — upstream `quantized_gemma3::ModelWeights` keeps its
+#     QMatMul weight fields private, so the PoM zero-dup gather can't reuse the
+#     inference engine's resident Gemma-3-4B weights and falls back to loading a
+#     duplicate ~2GB copy for the walk (blows VRAM on 6-8GB cards → PCIe paging).
+#     The vendored copy adds a `pom_quant_tensors()` accessor (mirroring
+#     quantized_llama_split) so `pom_shared()` can share Gemma weights, and caps
+#     `MAX_SEQ_LEN` 131072→8192 so the per-layer rotary sin/cos tables shrink
+#     ~4.3GB→~270MB (mining inference is capped at 2048 tokens anyway).
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
 candle-core = { path = "vendor/candle-core" }
+candle-transformers = { path = "vendor/candle-transformers" }
