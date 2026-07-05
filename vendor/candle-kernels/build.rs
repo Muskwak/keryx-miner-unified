@@ -22,6 +22,26 @@ const KERNEL_FILES: &[&str] = &[
     "ternary", "unary",
 ];
 
+/// Blackwell (sm_100/sm_120) needs nvcc 12.8+ — an older toolkit (e.g. a CUDA 12.2 build
+/// container predating Blackwell) hard-errors on `-gencode=arch=compute_100,...` with
+/// "nvcc fatal: Value 'sm_100' is not defined", aborting the fatbin for EVERY arch in the same
+/// invocation, not just the unsupported one. Detected once via `nvcc --version` so older
+/// toolchains still produce a working (Pascal-through-Hopper) fatbin instead of failing outright.
+fn nvcc_supports_blackwell(nvcc: &str) -> bool {
+    let Ok(out) = std::process::Command::new(nvcc).arg("--version").output() else { return false };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split("release ")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|v| {
+            let mut parts = v.trim().split('.');
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next()?.parse().ok()?;
+            Some((major, minor) >= (12, 8))
+        })
+        .unwrap_or(false)
+}
+
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
@@ -32,7 +52,10 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ptx_path = out_dir.join("ptx.rs");
     let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
-    let highest_arch = KERNEL_ARCHS.last().expect("KERNEL_ARCHS is non-empty");
+    let has_blackwell = nvcc_supports_blackwell(&nvcc);
+    let kernel_archs: Vec<&str> =
+        KERNEL_ARCHS.iter().copied().filter(|a| has_blackwell || (*a != "100" && *a != "120")).collect();
+    let highest_arch = kernel_archs.last().expect("kernel_archs is non-empty");
 
     let mut lookup_code = String::new();
     for name in KERNEL_FILES {
@@ -42,7 +65,7 @@ fn main() {
 
         let mut cmd = std::process::Command::new(&nvcc);
         cmd.args(["-fatbin", "-O3", "--expt-relaxed-constexpr", "-std=c++17"]);
-        for arch in KERNEL_ARCHS {
+        for arch in &kernel_archs {
             cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
         }
         // PTX-only entry for the newest listed arch, so the fatbin JITs forward onto any future

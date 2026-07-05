@@ -51,6 +51,27 @@ fn find_nvcc() -> String {
     "nvcc".to_string()
 }
 
+/// Blackwell (sm_100/sm_120) needs nvcc 12.8+ — older toolkits (e.g. a CUDA 12.2 container built
+/// before Blackwell existed) hard-error with "nvcc fatal: Value 'sm_100' is not defined for
+/// option 'gpu-architecture'" and abort the WHOLE build, including every older arch that toolkit
+/// CAN compile. Detected once via `nvcc --version` so older toolchains still produce a working
+/// (Pascal-through-Hopper) binary instead of failing outright.
+fn nvcc_supports_blackwell(nvcc: &str) -> bool {
+    let Ok(out) = std::process::Command::new(nvcc).arg("--version").output() else { return false };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Line of interest looks like "Cuda compilation tools, release 12.8, V12.8.61".
+    text.split("release ")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|v| {
+            let mut parts = v.trim().split('.');
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next()?.parse().ok()?;
+            Some((major, minor) >= (12, 8))
+        })
+        .unwrap_or(false)
+}
+
 /// Compile the PoM CUDA kernel to per-arch PTX for every major NVIDIA compute capability
 /// (Pascal 61 → Hopper 90) and emit an `$OUT_DIR/pom_ptx.rs` with a `get_pom_ptx((maj,min))`
 /// selector. The miner picks the matching PTX at runtime by querying each device's compute
@@ -72,11 +93,13 @@ fn build_cuda_ptx(out_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     // 12.8+ (the first CUDA 12.x release recognizing sm_100/sm_120) — no separate toolchain or
     // prebuilt fatbin required, unlike forks that pin an older nvcc and paper over the gap with a
     // manually-rebuilt binary blob.
-    let archs = [
+    let all_archs = [
         ("61", "PomMinerSm61"), ("70", "PomMinerSm70"), ("75", "PomMinerSm75"),
         ("80", "PomMinerSm80"), ("86", "PomMinerSm86"), ("89", "PomMinerSm89"),
         ("90", "PomMinerSm90"), ("100", "PomMinerSm100"), ("120", "PomMinerSm120"),
     ];
+    let has_blackwell = nvcc_supports_blackwell(&nvcc);
+    let archs: Vec<_> = all_archs.into_iter().filter(|(arch, _)| has_blackwell || (*arch != "100" && *arch != "120")).collect();
 
     for (arch, _name) in &archs {
         let ptx_path = format!("{out_dir}/pom_mine_sm{arch}.ptx");
