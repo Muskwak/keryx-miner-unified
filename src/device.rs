@@ -1,4 +1,4 @@
-//! Unified device model + backend trait (Phase 1, plan §2.1/§2.2).
+//! Unified device model + backend trait.
 //!
 //! Replaces the fork-per-binary era's bare `u32 device_id` — which meant a CUDA ordinal, a Vulkan
 //! enumeration index, OR a Metal device index depending on the fork, never more than one meaning
@@ -14,7 +14,7 @@
 //!   * Vulkan — AMD (RDNA3, validated), Intel Arc (planned, §6 open-q #5), Android (Adreno/Mali).
 //!   * Metal — Apple Silicon (macOS + iOS), zero-dup over candle's resident MTLBuffers.
 //!
-//! Vendor → backend routing (plan §2.3): NVIDIA→CUDA, AMD→Vulkan, Intel→Vulkan, Apple→Metal. A
+//! Vendor → backend routing: NVIDIA→CUDA, AMD→Vulkan, Intel→Vulkan, Apple→Metal. A
 //! machine with an NVIDIA + an AMD card enumerates two devices, one per backend, and mines both
 //! simultaneously (§2.6 heterogeneous-rig loop).
 
@@ -63,7 +63,7 @@ impl GpuHandle {
     /// Compatibility shim: the legacy single-backend binaries passed a bare `u32 device_id`. The
     /// dispatcher still accepts that (treated as the *process's* active backend, index = device_id)
     /// during the trait refactor so call sites can migrate incrementally — Phase 1 keeps today's
-    /// one-active-backend-per-build behaviour (plan §4 Phase 1) while the trait lands.
+    /// one-active-backend-per-build behaviour while the trait lands.
     pub fn legacy(device_id: u32) -> Self {
         Self {
             backend: active_backend(),
@@ -124,16 +124,16 @@ pub enum GpuVendor {
 /// NOTE on tier state: today each backend keeps its own process-global `MINING_TIERS` /
 /// `OOM_BANLIST` maps keyed by its native device index. The trait exposes the tier query/mutation
 /// methods so callers stay backend-agnostic, but the per-backend maps are NOT yet unified into a
-/// single `GpuHandle`-keyed store — that is a later generalization pass (plan §2.6) layered on top
+/// single `GpuHandle`-keyed store — that is a later generalization pass layered on top
 /// of this trait, which deliberately mirrors the exact shapes that already exist so the refactor
-/// is behaviour-preserving (plan §4 Phase 1: prove the trait before making backends additive).
+/// is behaviour-preserving.
 pub trait PomGpuBackend: Send + Sync {
     /// Backend discriminator.
     fn backend(&self) -> Backend;
 
     /// Every GPU this backend can talk to, in its own enumeration order. Empty (not an error)
     /// when the backend's driver/loader is absent — the unified probe just contributes zero
-    /// devices for that backend (plan §2.4: a both-features build runs fine with one vendor).
+    /// devices for that backend.
     fn enumerate(&self) -> Vec<GpuDeviceInfo>;
 
     /// VRAM (MB) of every device this backend sees, in `(native_index, mb)` pairs. The legacy
@@ -201,7 +201,7 @@ pub fn backends() -> &'static [Arc<dyn PomGpuBackend>] {
 
 /// The single registered backend on this process, if exactly one is registered. Convenience for
 /// the legacy single-backend code paths that haven't been generalized to iterate `backends()`
-/// yet (Phase 1 keeps one-active-backend-per-build, plan §4).
+/// yet (Phase 1 keeps one-active-backend-per-build,).
 pub fn sole_backend() -> Option<&'static Arc<dyn PomGpuBackend>> {
     let b = backends();
     if b.len() == 1 { Some(&b[0]) } else { None }
@@ -209,7 +209,7 @@ pub fn sole_backend() -> Option<&'static Arc<dyn PomGpuBackend>> {
 
 /// The unified, backend-tagged device list across every compiled-in backend whose probe succeeded.
 /// A heterogeneous rig (e.g. one NVIDIA + one AMD card) yields two entries, one per backend
-/// (plan §2.2). Empty when no backend found any device.
+///. Empty when no backend found any device.
 pub fn unified_device_list() -> Vec<GpuDeviceInfo> {
     let mut out = Vec::new();
     for b in backends() {

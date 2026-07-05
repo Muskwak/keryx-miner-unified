@@ -130,7 +130,7 @@ pub struct Vk {
     external_submit: Option<ExternalSubmit>,
     /// Whether the device's driver actually supports `shaderInt64` (queried, not assumed — see
     /// `new_for_device`). The PoM walk picks its native (uint64) or `_i32` (emulated) shader
-    /// variant off this. False on Adreno and (per plan §2.4, unvalidated) possibly Intel Arc.
+    /// variant off this. False on Adreno and (unvalidated) possibly Intel Arc.
     shader_int64: bool,
 }
 
@@ -205,7 +205,7 @@ impl Vk {
             // Query actual feature support before requesting anything. Drivers can advertise a
             // Vulkan 1.2/1.3 apiVersion while still leaving individual *optional* core-1.2 features
             // unimplemented — confirmed on a real Adreno 740 (Snapdragon 8 Gen 2), which supports
-            // bufferDeviceAddress but NOT shaderInt64 despite Vulkan 1.3 conformance (plan §2.4:
+            // bufferDeviceAddress but NOT shaderInt64 despite Vulkan 1.3 conformance (:
             // the same gap is a real risk on desktop Intel Arc). bufferDeviceAddress has no fallback
             // (hard requirement, since the weight blob can exceed maxStorageBufferRange);
             // shaderInt64 is optional — pom_walk.rs picks the native (fast) or `_i32`
@@ -353,7 +353,7 @@ impl Vk {
     /// Whether this device's driver actually supports `shaderInt64` (queried at device open, not
     /// assumed — see `new_for_device`). The PoM walk picks its native (`pom_walk.comp`, uint64) or
     /// emulated (`pom_walk_i32.comp`, uvec2 + Barrett reduction) shader variant off this. False on
-    /// Adreno and (per plan §2.4, unvalidated) possibly Intel Arc — those drivers report Vulkan
+    /// Adreno and (unvalidated) possibly Intel Arc — those drivers report Vulkan
     /// 1.3 conformance but leave this optional core feature unimplemented.
     pub fn supports_shader_int64(&self) -> bool {
         self.shader_int64

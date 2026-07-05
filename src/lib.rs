@@ -4,13 +4,13 @@ use std::error::Error as StdError;
 
 pub mod models;
 pub mod pom;
-// Unified cross-vendor device model (plan §2.1/§2.2). Backend-qualified `GpuHandle`, the
+// Unified cross-vendor device model. Backend-qualified `GpuHandle`, the
 // `PomGpuBackend` trait every backend implements, and the startup multi-backend probe + unified
 // device enumeration. The free-function `pom_gpu` modules below remain the per-backend shims for
 // the legacy single-active-backend code paths; Phase 3 makes backends additive and routes every
 // call through the dispatcher in `device.rs` instead.
 pub mod device;
-// Inference engine abstraction (plan §2.5, Phase 4): the seam between the candle (CUDA/Metal) and
+// Inference engine abstraction: the seam between the candle (CUDA/Metal) and
 // llama.cpp+Vulkan inference engines, picked once at startup by which backend serves the inference
 // GPU. Always compiled in (the decision is cfg-driven internally); the llama.cpp impl is in
 // llm_engine.rs, gated to the `vulkan` feature.
@@ -30,7 +30,7 @@ pub mod pom_gpu;
 #[path = "pom_gpu_vulkan.rs"]
 pub mod pom_gpu;
 // Desktop Vulkan backend (AMD RDNA3 / Intel Arc), ported from keryx-miner-rdna3. Compiled in only
-// when the `vulkan` Cargo feature is on (a desktop Windows/Linux build alongside CUDA, plan §2.4).
+// when the `vulkan` Cargo feature is on (a desktop Windows/Linux build alongside CUDA,).
 // Its zero-dup walk reads the in-process llama.cpp engine's resident weights — see llm_engine.rs.
 #[cfg(feature = "vulkan")]
 pub mod pom_gpu_vulkan_desktop;

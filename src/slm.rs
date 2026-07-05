@@ -1174,7 +1174,7 @@ pub fn pom_shared(
     }
 }
 
-// ── llama.cpp+Vulkan inference seam (plan §2.5, Phase 4) ─────────────────────
+// ── llama.cpp+Vulkan inference seam ─────────────────────
 //
 // The desktop Vulkan backend (AMD/Intel), ported from keryx-miner-rdna3, drives OPoI inference
 // through an in-process llama.cpp engine (`llm_engine::LlamaEngine`) instead of candle. Its

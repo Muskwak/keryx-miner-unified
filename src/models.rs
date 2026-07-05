@@ -371,7 +371,7 @@ pub fn available_names() -> Vec<&'static str> {
     REGISTRY.iter().map(|m| m.name).collect()
 }
 
-// ── Consensus-pinned PoM anchors (plan §2.5 / Phase 4 zero-dup validation) ────
+// ── Consensus-pinned PoM anchors ────
 //
 // A model's canonical 32 B-chunk blake3 Merkle root `R_T` and chunk count `N`, produced offline by
 // `pom-rt-builder`. The Vulkan desktop backend asserts its freshly-built possession index matches

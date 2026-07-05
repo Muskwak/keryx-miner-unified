@@ -1,4 +1,4 @@
-//! `PomGpuBackend` trait implementations for each compiled-in backend (plan §2.2, Phase 1).
+//! `PomGpuBackend` trait implementations for each compiled-in backend.
 //!
 //! Phase 1 deliberately keeps every backend's existing free-function module
 //! (`pom_gpu.rs` / `pom_gpu_metal.rs` / `pom_gpu_vulkan.rs`) as the source of truth and the
@@ -326,7 +326,7 @@ impl PomGpuBackend for VulkanDesktopBackend {
 /// well-known name substrings the drivers report. NVIDIA is intentionally NOT matched here:
 /// NVIDIA cards on a heterogeneous rig route to the CUDA backend (which probes them separately),
 /// so a NVIDIA-named Vulkan device only appears if CUDA is absent — and then it's still mined via
-/// Vulkan (the routing table's "NVIDIA → CUDA, else Vulkan" fallback, plan §2.3 / open-q #2).
+/// Vulkan (the routing table's "NVIDIA → CUDA, else Vulkan" fallback, / open-q #2).
 #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 fn parse_vulkan_vendor(name: &str) -> GpuVendor {
     let lower = name.to_ascii_lowercase();

@@ -17,8 +17,6 @@ Each GPU mining backend and each inference engine is formalized behind a trait
 binary holds several live backends at once and dispatches to whichever one actually talks to a given
 device at runtime — no per-vendor fork, no "which vendor" flag.
 
-See [`plan.md`](plan.md) for the full architecture and phased plan.
-
 ---
 
 ## Status
@@ -158,8 +156,6 @@ Models load on demand and are cached between requests. Mining pauses during infe
 * **Inference engines** — candle (CUDA on NVIDIA, Metal on Apple) and llama.cpp+Vulkan (AMD/Intel/
   Android), picked once at startup by which backend serves the inference GPU. The zero-dup PoM walk
   reads each engine's own resident weights (no second VRAM copy).
-
-Full detail in [`plan.md`](plan.md).
 
 ---
 

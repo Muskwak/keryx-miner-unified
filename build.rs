@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Backend build steps ──────────────────────────────────────────────────
     //
-    // Backends are additive per OS (plan §2.4): Windows/Linux compile `cuda` + `vulkan`
+    // Backends are additive per OS: Windows/Linux compile `cuda` + `vulkan`
     // together (one binary covers an NVIDIA + AMD rig), macOS/iOS compile `metal`, Android
     // compiles `vulkan`.
     //

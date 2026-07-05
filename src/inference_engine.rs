@@ -1,4 +1,4 @@
-//! Inference engine abstraction (plan §2.5, Phase 4).
+//! Inference engine abstraction.
 //!
 //! The second major axis of divergence across the three forks, INDEPENDENT of the mining-kernel
 //! backend. Each fork's inference engine is paired with the GPU vendor it serves:
@@ -27,7 +27,7 @@
 
 /// One resident inference engine serving OPoI challenges for its loaded model. The engine is
 /// picked once at startup based on which backend serves the machine's designated inference GPU
-/// (plan §2.3 / §2.5): candle-CUDA on NVIDIA, candle-Metal on Apple, llama.cpp-Vulkan on
+///: candle-CUDA on NVIDIA, candle-Metal on Apple, llama.cpp-Vulkan on
 /// AMD/Intel/Android.
 ///
 /// The shape deliberately mirrors the surface both engines already expose:
@@ -55,7 +55,7 @@ pub trait InferenceEngine: Send + Sync {
 }
 
 /// Pick the inference engine for the machine's designated inference GPU, based on which backend
-/// serves it (plan §2.5). Called once at startup. NVIDIA → candle-CUDA, Apple → candle-Metal,
+/// serves it. Called once at startup. NVIDIA → candle-CUDA, Apple → candle-Metal,
 /// AMD/Intel/Android → llama.cpp-Vulkan.
 ///
 /// Phase 4 returns `EngineChoice::LlamaCpp` when the `vulkan` feature compiled the desktop Vulkan

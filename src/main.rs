@@ -391,7 +391,7 @@ async fn run() -> Result<(), Error> {
     info!(" Mining for: {}", opt.mining_address.as_deref().unwrap_or("(recovery mode)"));
     info!("=================================================================================");
 
-    // Unified device model (plan §2.1/§2.2): register every backend compiled into this binary
+    // Unified device model: register every backend compiled into this binary
     // with the dispatcher. Phase 1 registers one backend (the per-OS exclusivity every fork has
     // today); Phase 3 makes desktop Windows/Linux register both CUDA + Vulkan so one binary mines
     // a heterogeneous rig. Done after logging is up so a probe failure is observable.

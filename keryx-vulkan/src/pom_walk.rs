@@ -2,13 +2,13 @@
 //! find the lowest nonce in a batch whose `pom_pow_value <= target`. The folds are byte-identical
 //! to `src/pom.rs`, so a nonce found here builds a `PomProof` the node accepts.
 //!
-//! Two shader variants, picked at runtime by [`Vk::supports_shader_int64`] (plan §2.4):
+//! Two shader variants, picked at runtime by [`Vk::supports_shader_int64`]:
 //!   - `pom_walk.comp` — native `uint64_t` arithmetic + Granlund-Montgomery fast modulo. Used
 //!     whenever the device supports `shaderInt64` (all desktop AMD/NVIDIA GPUs, and some mobile).
 //!   - `pom_walk_i32.comp` — the same math hand-emulated over `uvec2` (lo, hi) pairs with a
 //!     Barrett-reduction modulo. Used when `shaderInt64` is unavailable (confirmed missing on
 //!     Qualcomm Adreno 740 by direct device query, despite otherwise-modern Vulkan 1.3 support;
-//!     plan §2.4 flags the same gap as a real risk on desktop Intel Arc). Costs more ALU work per
+//!     flags the same gap as a real risk on desktop Intel Arc). Costs more ALU work per
 //!     nonce, so it's only used where the native path genuinely isn't an option.
 //!
 //! Both variants read/write the exact same byte layout for the weight blob and shard address
@@ -177,7 +177,7 @@ impl PomWalkGpu {
         let vk = Vk::new_for_device(device_index)?;
         // Pick the native (uint64) or emulated (uvec2) shader variant based on the device's actual
         // shaderInt64 support — see Vk::supports_shader_int64. Adreno (and possibly Intel Arc,
-        // plan §2.4) report Vulkan 1.3 but omit this optional feature; the i32 variant keeps them
+        //) report Vulkan 1.3 but omit this optional feature; the i32 variant keeps them
         // mining correctly, just slower.
         let use_i32 = !vk.supports_shader_int64();
         if use_i32 && n_chunks >= MAX_N_CHUNKS_FOR_I32_MOD {

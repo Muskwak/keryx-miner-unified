@@ -90,7 +90,7 @@ version = "0.25"
 # Apple) and the `#[cfg]` module selection in lib.rs. These `cuda`/`vulkan`/`metal` features are
 # ADDITIVE opt-in flags that turn on the unified-dispatcher code paths (device.rs) and, for
 # `vulkan`, the desktop Vulkan mining module + in-process llama.cpp inference engine — letting a
-# single desktop binary mine a heterogeneous NVIDIA+AMD rig (plan §2.4 / §4 Phase 3).
+# single desktop binary mine a heterogeneous NVIDIA+AMD rig.
 #
 # Build a heterogeneous-rig desktop binary with:
 #   cargo build --features cuda,vulkan
@@ -99,7 +99,7 @@ parking_lot = ["parking", "tokio/parking_lot"]
 bench = []
 no-asm = ["keccak"]
 
-# ── GPU backend features (plan §2.4 — additive per OS) ───────────────────────
+# ── GPU backend features ───────────────────────
 #
 # Backends are NOT mutually exclusive the way they were in each fork. A single Windows/Linux binary
 # can compile `cuda` + `vulkan` together so it mines a heterogeneous rig (one NVIDIA + one AMD card)
@@ -141,7 +141,7 @@ keccak = "0.1"
 candle-core = { version = "0.9", features = ["cuda"] }
 candle-transformers = { version = "0.9", features = ["cuda"] }
 candle-nn = { version = "0.9", features = ["cuda"] }
-# Desktop Vulkan backend (AMD RDNA3 / Intel Arc), plan §2.4. Activated by the `vulkan` Cargo
+# Desktop Vulkan backend (AMD RDNA3 / Intel Arc), Activated by the `vulkan` Cargo
 # feature — all three Vulkan deps are `optional = true` so a CUDA-only desktop build pulls none of
 # them. The `vulkan` feature implies `dep:keryx-vulkan` + `dep:llama-cpp-2` + `dep:llama-cpp-sys-2`
 # (see [features]); a CUDA-only `cargo build` compiles neither.
