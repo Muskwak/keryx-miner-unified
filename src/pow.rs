@@ -297,6 +297,12 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
 
     decode_to_slice(&header.pruning_point, &mut hash).unwrap();
     hasher.update(hash);
+
+    // H3: the block hash commits to the walk's final state. NEVER part of the pre-PoW hash
+    // (the walk seed derives from it, same as nonce) — mirrors the node's `hashing::header::hash`.
+    if !for_pre_pow && pom::is_h3(header.daa_score) {
+        hasher.update(header.pom_final_state.to_le_bytes());
+    }
 }
 
 #[allow(dead_code)] // False Positive: https://github.com/rust-lang/rust/issues/88900
@@ -451,6 +457,7 @@ mod tests {
             blue_work: "ce5639b8ed46571e20eeaa7a62a078f8c55aef6edd6a35ed37a3d6cf98736abd".into(),
             pruning_point: "fc44c4f57cf8f7a2ba410a70d0ad49060355b9deb97012345603d9d0d1dcb0de".into(),
             blue_score: 29372123613087746,
+            pom_final_state: 0,
         };
         let expected_res = [
             245, 95, 9, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 98, 165, 238, 232, 42, 189, 244, 74, 45, 11, 117,
