@@ -1,0 +1,267 @@
+use clap::ArgMatches;
+use std::any::Any;
+use std::error::Error as StdError;
+
+pub mod models;
+pub mod pom;
+// Unified cross-vendor device model (plan §2.1/§2.2). Backend-qualified `GpuHandle`, the
+// `PomGpuBackend` trait every backend implements, and the startup multi-backend probe + unified
+// device enumeration. The free-function `pom_gpu` modules below remain the per-backend shims for
+// the legacy single-active-backend code paths; Phase 3 makes backends additive and routes every
+// call through the dispatcher in `device.rs` instead.
+pub mod device;
+// Inference engine abstraction (plan §2.5, Phase 4): the seam between the candle (CUDA/Metal) and
+// llama.cpp+Vulkan inference engines, picked once at startup by which backend serves the inference
+// GPU. Always compiled in (the decision is cfg-driven internally); the llama.cpp impl is in
+// llm_engine.rs, gated to the `vulkan` feature.
+pub mod inference_engine;
+// PoM GPU walk: CUDA backend on Linux/Windows rigs, Metal backend on Apple Silicon, Vulkan
+// backend on Android. All three modules expose the same free-function surface
+// (install/uninstall/is_installed/is_loading/mine/current_tier/ensure_installed/
+// set_mining_tier/device_for_model), so main.rs / miner.rs / slm.rs / ios.rs / android.rs stay
+// backend-agnostic. iOS is NOT macOS and Android is neither, so each must be listed explicitly
+// here or it would fall through to the CUDA path (which can't build on either).
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+pub mod pom_gpu;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[path = "pom_gpu_metal.rs"]
+pub mod pom_gpu;
+#[cfg(target_os = "android")]
+#[path = "pom_gpu_vulkan.rs"]
+pub mod pom_gpu;
+// Desktop Vulkan backend (AMD RDNA3 / Intel Arc), ported from keryx-miner-rdna3. Compiled in only
+// when the `vulkan` Cargo feature is on (a desktop Windows/Linux build alongside CUDA, plan §2.4).
+// Its zero-dup walk reads the in-process llama.cpp engine's resident weights — see llm_engine.rs.
+#[cfg(feature = "vulkan")]
+pub mod pom_gpu_vulkan_desktop;
+// In-process OPoI inference via llama.cpp FFI (Vulkan backend), ported from keryx-miner-rdna3.
+// The inference engine for the desktop Vulkan path (AMD/Intel/Android); candle is used on the
+// CUDA/Metal paths instead. Gated to `vulkan` since it pulls in llama-cpp-2.
+#[cfg(feature = "vulkan")]
+pub mod llm_engine;
+// PomGpuBackend trait impls wrapping each compiled-in backend's free functions, plus the
+// `register_compiled_backends` entry point that hands them to the `device` dispatcher.
+pub mod pom_gpu_backends;
+pub mod slm;
+pub mod xoshiro256starstar;
+
+// Stratum wire protocol (JSON-RPC line codec + message types). Lives in the lib
+// so both the desktop binary's StratumHandler and the iOS stratum client share
+// one implementation instead of duplicating the wire format.
+pub mod statum_codec;
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub mod proto {
+    #![allow(clippy::derive_partial_eq_without_eq)]
+    tonic::include_proto!("protowire");
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub mod target;
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+type Hash = target::Uint256;
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub mod pow;
+
+// Sync watch channel (Condvar-based) — lets the async gRPC receiver hand the
+// latest block template to the blocking GPU mining thread, coalescing so the
+// miner never falls behind. Same module the desktop binary uses (main.rs).
+#[cfg(any(target_os = "ios", target_os = "android"))]
+mod watch;
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub mod inference;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub mod quantized_llama_split;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub mod quantized_qwen3_split;
+
+#[cfg(target_os = "ios")]
+pub mod ios;
+#[cfg(target_os = "android")]
+pub mod android;
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+use libloading::{Library, Symbol};
+
+pub type Error = Box<dyn StdError + Send + Sync + 'static>;
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[derive(Default)]
+pub struct PluginManager {
+    plugins: Vec<Box<dyn Plugin>>,
+    loaded_libraries: Vec<Library>,
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+#[derive(Default)]
+pub struct PluginManager {
+    _private: (),
+}
+
+/**
+ Plugin Manager class - allows inserting your own hashers
+ Inspired by https://michael-f-bryan.github.io/rust-ffi-guide/dynamic_loading.html
+*/
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+impl PluginManager {
+    pub fn new() -> Self {
+        Self { plugins: Vec::new(), loaded_libraries: Vec::new() }
+    }
+
+    pub(crate) unsafe fn load_single_plugin<'help>(
+        &mut self,
+        app: clap::App<'help>,
+        path: &str,
+    ) -> Result<clap::App<'help>, (clap::App<'help>, Error)> {
+        type PluginCreate<'help> =
+            unsafe fn(*const clap::App<'help>) -> (*mut clap::App<'help>, *mut dyn Plugin, *mut Error);
+
+        let lib = match Library::new(path) {
+            Ok(l) => l,
+            Err(e) => return Err((app, e.to_string().into())),
+        };
+
+        self.loaded_libraries.push(lib);
+        let lib = self.loaded_libraries.last().unwrap();
+
+        let constructor: Symbol<PluginCreate> = match lib.get(b"_plugin_create") {
+            Ok(cons) => cons,
+            Err(e) => return Err((app, e.to_string().into())),
+        };
+
+        let (app, boxed_raw, error) = constructor(Box::into_raw(Box::new(app)));
+        let app = *Box::from_raw(app);
+
+        if boxed_raw.is_null() {
+            return Err((app, *Box::from_raw(error)));
+        }
+        let plugin = Box::from_raw(boxed_raw);
+        self.plugins.push(plugin);
+
+        Ok(app)
+    }
+
+    pub fn build(&self) -> Result<Vec<Box<dyn WorkerSpec + 'static>>, Error> {
+        let mut specs = Vec::<Box<dyn WorkerSpec + 'static>>::new();
+        for plugin in &self.plugins {
+            if plugin.enabled() {
+                specs.extend(plugin.get_worker_specs());
+            }
+        }
+        Ok(specs)
+    }
+
+    pub fn process_options(&mut self, matchs: &ArgMatches) -> Result<usize, Error> {
+        let mut count = 0usize;
+        self.plugins.iter_mut().for_each(|plugin| {
+            count += match plugin.process_option(matchs) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: Failed processing options for {} (ignore if you do not intend to use): {}",
+                        plugin.name(),
+                        e
+                    );
+                    0
+                }
+            }
+        });
+        Ok(count)
+    }
+
+    pub fn has_specs(&self) -> bool {
+        !self.plugins.is_empty()
+    }
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+impl PluginManager {
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+
+    pub fn build(&self) -> Result<Vec<Box<dyn WorkerSpec + 'static>>, Error> {
+        Ok(Vec::new())
+    }
+
+    pub fn process_options(&mut self, _matchs: &ArgMatches) -> Result<usize, Error> {
+        Ok(0)
+    }
+
+    pub fn has_specs(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub trait Plugin: Any + Send + Sync {
+    fn name(&self) -> &'static str;
+    fn enabled(&self) -> bool;
+    fn get_worker_specs(&self) -> Vec<Box<dyn WorkerSpec>>;
+    fn process_option(&mut self, matchs: &ArgMatches) -> Result<usize, Error>;
+}
+
+pub trait WorkerSpec: Any + Send + Sync {
+    fn id(&self) -> String;
+    fn build(&self) -> Box<dyn Worker>;
+}
+
+pub trait Worker {
+    fn id(&self) -> String;
+    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]);
+    fn calculate_hash(&mut self, nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64);
+    fn sync(&self) -> Result<(), Error>;
+    fn get_workload(&self) -> usize;
+    fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error>;
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+pub fn load_plugins<'help>(
+    app: clap::App<'help>,
+    paths: &[String],
+) -> Result<(clap::App<'help>, PluginManager), Error> {
+    let mut factory = PluginManager::new();
+    let mut app = app;
+    for path in paths {
+        app = unsafe {
+            factory.load_single_plugin(app, path.as_str()).unwrap_or_else(|(app, e)| {
+                eprintln!("WARNING: Failed loading plugin {} (ignore if you do not intend to use): {}", path, e);
+                app
+            })
+        };
+    }
+    Ok((app, factory))
+}
+
+#[macro_export]
+macro_rules! declare_plugin {
+    ($plugin_type:ty, $constructor:path, $args:ty) => {
+        use clap::Args;
+        #[no_mangle]
+        pub unsafe extern "C" fn _plugin_create(
+            app: *mut clap::App,
+        ) -> (*mut clap::App, *mut dyn $crate::Plugin, *const $crate::Error) {
+            // make sure the constructor is the correct type.
+            let constructor: fn() -> Result<$plugin_type, $crate::Error> = $constructor;
+
+            let object = match constructor() {
+                Ok(obj) => obj,
+                Err(e) => {
+                    return (
+                        app,
+                        unsafe { std::mem::MaybeUninit::zeroed().assume_init() }, // Translates to null pointer
+                        Box::into_raw(Box::new(e)),
+                    );
+                }
+            };
+
+            let boxed: Box<dyn $crate::Plugin> = Box::new(object);
+
+            let boxed_app = Box::new(<$args>::augment_args(unsafe { *Box::from_raw(app) }));
+            (Box::into_raw(boxed_app), Box::into_raw(boxed), std::ptr::null::<Error>())
+        }
+    };
+}

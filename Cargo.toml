@@ -1,0 +1,216 @@
+[package]
+name = "keryx-miner"
+version = "0.3.7"
+edition = "2021"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/keryx-labs/keryx-miner"
+readme = "README.md"
+description = "A fast CPU & GPU miner for Keryx"
+categories = ["command-line-utilities"]
+keywords = ["blockchain", "cli"]
+autobins = false
+
+[lib]
+name = "keryx_miner"
+path = "src/lib.rs"
+# cdylib is for Android: JNI native libraries load as a shared object via System.loadLibrary.
+# Harmless extra build artifact on the other platforms (which use "lib"/"staticlib").
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "keryx-miner"
+path = "src/main.rs"
+include = [
+    "src/**/*.rs",
+    "src/**/*.s",
+    "proto/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "README.md",
+]
+
+[dependencies]
+tonic = "0.8"
+tokio = { version = "1.17", features = ["macros", "rt-multi-thread"] }
+prost = "0.11"
+futures-util = "0.3"
+tokio-stream = {version = "0.1", features = ["net"]}
+once_cell = "1"
+num_cpus = "1"
+rand = "0.8"
+blake2b_simd = "1.0.0"
+clap = { version = "3.0", features = ["color", "derive"]}
+log = "0.4"
+env_logger = "0.9"
+keccak = { version = "0.1", optional = true }
+parking = { package = "parking_lot", version = "0.12", optional = true }
+tokio-util = {version = "0.7.0", features = ["codec"]}
+serde_json = "1.0"
+serde_repr = "0.1"
+serde =  {version="1.0", features=["derive"]}
+futures = "0.3.21"
+bytes = "1.1.0"
+async-trait = "0.1"
+num = "0.4"
+hex = "0.4"
+keryx-inference = { path = "inference" }
+secp256k1 = { version = "0.29.0", features = ["global-context"] }
+semver = "1.0"
+# Proof-of-Model: possession proof construction (borsh wire-format must match the node).
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
+# Phase-3 OPoI: SLM inference via candle. The GPU backend is selected per target —
+# CUDA on Linux/Windows rigs, Metal on Apple Silicon — in the [target.*] sections below.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+ureq = { version = "2", features = ["tls"] }
+base64 = "0.22"
+anyhow = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+flate2 = "1.0"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# libloading (dlopen/dlsym) is not available on iOS or Android — both are static-linked-app-only
+# platforms with no desktop plugin system. Gate it behind the full-desktop feature so the
+# iOS/Android staticlib/cdylib crate-types compile.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+libloading = "0.7"
+
+# nix (UNIX signal handling, pthread_kill) is for the desktop CLI's freeze handler — not used on
+# iOS or Android, which run as a single foreground app with no such handler.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies.nix]
+version = "0.25"
+
+[features]
+# An unmodified `cargo build` produces the same per-fork binary as before: the per-OS backend is
+# still chosen by the `target.cfg` dependency gating below (candle-cuda on desktop, candle-metal on
+# Apple) and the `#[cfg]` module selection in lib.rs. These `cuda`/`vulkan`/`metal` features are
+# ADDITIVE opt-in flags that turn on the unified-dispatcher code paths (device.rs) and, for
+# `vulkan`, the desktop Vulkan mining module + in-process llama.cpp inference engine — letting a
+# single desktop binary mine a heterogeneous NVIDIA+AMD rig (plan §2.4 / §4 Phase 3).
+#
+# Build a heterogeneous-rig desktop binary with:
+#   cargo build --features cuda,vulkan
+default = ["parking_lot"]
+parking_lot = ["parking", "tokio/parking_lot"]
+bench = []
+no-asm = ["keccak"]
+
+# ── GPU backend features (plan §2.4 — additive per OS) ───────────────────────
+#
+# Backends are NOT mutually exclusive the way they were in each fork. A single Windows/Linux binary
+# can compile `cuda` + `vulkan` together so it mines a heterogeneous rig (one NVIDIA + one AMD card)
+# in one process; macOS/iOS compile `metal`; Android compiles `vulkan`. build.rs invokes nvcc
+# (cuda) and/or glslc (vulkan) for whichever features are on; a toolchain that isn't installed just
+# isn't invoked (its feature is off), so a CUDA-only build never needs glslc and vice-versa.
+#
+# At runtime each compiled-in backend probes its own driver (cudarc / ash / objc2-metal) and
+# contributes zero or more devices to the unified list (device.rs); a both-features build runs fine
+# on a machine with only one vendor's GPU — the other backend's probe just finds nothing.
+cuda = []
+# vulkan pulls the desktop Vulkan mining module (pom_gpu_vulkan_desktop.rs) + the in-process
+# llama.cpp (Vulkan) inference engine (llm_engine.rs). Both deps are heavy (keryx-vulkan compiles
+# SPIR-V shaders; llama-cpp-2 is a C++/cmake build), so they're optional and only pulled when this
+# feature is on. On Android `keryx-vulkan` is already a non-optional target dep (see below).
+vulkan = ["dep:llama-cpp-2", "dep:keryx-vulkan", "dep:llama-cpp-sys-2"]
+metal = []
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keccak = "0.1"
+kernel32-sys = "0.2"
+win32console = "0.1"
+
+# On non-x86_64 targets (e.g. aarch64-apple-darwin / aarch64-apple-ios) the
+# hand-written keccakf1600 assembly in src/keccakf1600_x86-64*.s is unusable, so
+# fall back to the pure-Rust `keccak` crate. src/pow/keccak.rs selects this via
+# #[cfg]. Covers both macOS and iOS Metal builds.
+[target.'cfg(all(not(target_arch = "x86_64"), not(target_os = "windows")))'.dependencies]
+keccak = "0.1"
+
+# OPoI inference backend, chosen at build time. candle's `cuda` and `metal` features
+# are mutually exclusive backends: CUDA for NVIDIA rigs, Metal for Apple Silicon
+# (both macOS and iOS). Android is excluded here too — candle has no Vulkan backend, so
+# Android runs candle on the plain CPU device (see the android-specific block below); it only
+# ever uses candle for GGUF parsing (building the PoM weight blob) and model downloads, never
+# GPU inference. On macOS the vendored `candle-kernels` patch below is unused (it is CUDA-only)
+# and cargo will emit a harmless "patch not used" warning.
+[target.'cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))'.dependencies]
+candle-core = { version = "0.9", features = ["cuda"] }
+candle-transformers = { version = "0.9", features = ["cuda"] }
+candle-nn = { version = "0.9", features = ["cuda"] }
+# Desktop Vulkan backend (AMD RDNA3 / Intel Arc), plan §2.4. Activated by the `vulkan` Cargo
+# feature — all three Vulkan deps are `optional = true` so a CUDA-only desktop build pulls none of
+# them. The `vulkan` feature implies `dep:keryx-vulkan` + `dep:llama-cpp-2` + `dep:llama-cpp-sys-2`
+# (see [features]); a CUDA-only `cargo build` compiles neither.
+#
+# To build a heterogeneous-rig desktop binary (NVIDIA + AMD in one process):
+#   cargo build --features cuda,vulkan
+keryx-vulkan = { path = "keryx-vulkan", optional = true }
+# In-process OPoI inference via llama.cpp FFI (Vulkan backend), ported from keryx-miner-rdna3.
+# Pulled from the keryx fork branch carrying the windows-gnu vulkan build fixes + the ggml FFI
+# exports (raw handles, tensor BDA, guarded queue submit) the zero-dup PoM walk needs. Heavy C++ /
+# cmake build, hence optional + feature-gated. Pinned by rev for reproducible release builds.
+llama-cpp-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "b39b1ae62b2c78cadf9ef5e80aef63003cff32f4", default-features = false, features = ["vulkan"], optional = true }
+# Direct sys-crate access for the keryx FFI exports — llama-cpp-2 does not re-export its sys crate.
+llama-cpp-sys-2 = { git = "https://github.com/shmutalov/llama-cpp-rs", rev = "b39b1ae62b2c78cadf9ef5e80aef63003cff32f4", default-features = false, optional = true }
+
+# Metal backend: shared by macOS and iOS. Both platforms have native Metal.framework
+# and the same GPU family (Apple Silicon unified memory).
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+candle-core = { version = "0.9", features = ["metal"] }
+candle-transformers = { version = "0.9", features = ["metal"] }
+candle-nn = { version = "0.9", features = ["metal"] }
+# candle 0.9 wraps Metal via `candle_metal_kernels::metal` (built on objc2-metal), not the
+# metal-rs crate. Depending on the same wrapper lets pom_gpu_metal.rs use the exact same
+# Device/Buffer/CommandQueue/ComputePipeline types candle already holds — no re-wrapping.
+# objc2-metal supplies MTLSize / MTLResourceOptions used in the compute dispatch below.
+candle-metal-kernels = "0.9"
+objc2-metal = "0.3"
+
+# Android: plain CPU candle (default features, no cuda/metal/mkl/accelerate) — candle has no
+# Vulkan backend, so it's only used here to parse GGUF tensors (packing the PoM weight blob) and
+# model downloads, never GPU inference. Also: jni (android.rs's JNI bridge) and keryx-vulkan (the
+# PoM GPU walk, a vendored/trimmed port of the RDNA3 fork's desktop AMD Vulkan backend).
+[target.'cfg(target_os = "android")'.dependencies]
+candle-core = { version = "0.9" }
+candle-transformers = { version = "0.9" }
+candle-nn = { version = "0.9" }
+jni = "0.21"
+keryx-vulkan = { path = "keryx-vulkan" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[build-dependencies]
+tonic-build = { version = "0.8", default-features = false, features = ["prost", "transport"] }
+cc = "1"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
+
+[workspace]
+members = ["inference", "plugins/*", "keryx-vulkan"]
+default-members = ["."]
+
+# Vendored candle patches:
+#   * candle-kernels — upstream MoE bf16 WMMA kernels only compile for sm_80+,
+#     which would exclude Turing/Pascal (and thus all pre-Ampere miners) from
+#     inference. The vendored copy guards those kernel bodies with
+#     `#if __CUDA_ARCH__ >= 800` so the crate builds at sm_75 (stub on older
+#     archs, real MoE on sm_80+).
+#   * candle-core — upstream keeps `QTensor::storage` private and returns an
+#     unimplemented `device_ptr` on the Metal branch, so the Metal PoM miner
+#     cannot see candle's own `MTLBuffer`s and would be forced to blit every
+#     tensor out of unified memory into a packed weight buffer. The vendored
+#     copy adds `QTensor::metal_storage(&self) -> Option<&QMetalStorage>` so
+#     the miner can build a bindless pointer table over the existing buffers
+#     and skip the copy. Linux/Windows CUDA builds keep the crates.io copy —
+#     cargo will emit a harmless "patch not used" warning there.
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }
+candle-core = { path = "vendor/candle-core" }

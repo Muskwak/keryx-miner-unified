@@ -1,0 +1,26 @@
+[package]
+name = "keryx-vulkan"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan compute backend for the Keryx RDNA3 miner (PoM walk + kHeavyHash PoW)"
+license = "MIT/Apache-2.0"
+
+[features]
+# Opt-in PoM-walk micro-benchmark (src/bench.rs + examples/bench_pom_walk.rs). Off by default so
+# the shipped miner never carries the variant SPIR-V or timing code.
+bench = []
+
+[dependencies]
+# ash is a thin, dynamically-loaded Vulkan binding — no Vulkan SDK needed to BUILD, only the
+# vulkan-1 loader (shipped with the AMD driver) to RUN. Perfect for a no-toolchain RDNA3 target.
+ash = "0.38"
+
+[[example]]
+name = "bench_pom_walk"
+required-features = ["bench"]
+
+[dev-dependencies]
+rand = "0.8"
+# Trusted Keccak-f[1600] oracle for the kHeavyHash test — the same crate the miner's host PoW
+# path uses on Windows, so the GPU shader is validated against the real reference permutation.
+keccak = "0.1"

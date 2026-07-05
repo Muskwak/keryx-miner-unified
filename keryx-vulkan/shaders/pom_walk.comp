@@ -1,0 +1,128 @@
+#version 460
+// Keryx Proof-of-Model walk — Vulkan compute port of `pom::walk_final` + `pom_block_seed`
+// + `pom_pow_value` + `le_leq`. BYTE-IDENTICAL to src/pom.rs (and thus to the node verifier and
+// the original CUDA `pom_mine.cu`): same mix64 folds, same little-endian word layout, same walk.
+//
+// One invocation == one nonce. Each invocation re-derives the block seed, walks K data-dependent
+// 32-byte chunks of the resident weight blob, folds to a 256-bit pow value, and — if it is <= the
+// target — records its batch offset via atomicMin so the host recovers the LOWEST winning nonce.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 256) in; // 8 × 32-wide wavefronts on RDNA2 — more waves hide memory latency
+
+// A weight shard as 32-byte chunk structs (`u64vec4` = 4 × uint64_t = 32 bytes), reached by GPU
+// device address. A single 32-byte read (coalesced `buffer_load_dwordx8`) replaces 4 individual
+// 8-byte reads, reducing instruction count in the hot walk loop.
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Shard {
+    u64vec4 chunks[];
+};
+
+// Lowest winning batch offset (nonce - start_nonce). Initialised to 0xFFFFFFFF by the host;
+// 0xFFFFFFFF on readback == "no winner in this batch".
+layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
+
+// One GPU device address per weight shard, in shard order.
+layout(std430, binding = 1) readonly buffer ShardAddrs { uint64_t addr[]; } SHARDS;
+
+layout(push_constant) uniform Push {
+    uint64_t p0, p1, p2, p3;   // pre_pow_hash, as 4 LE u64 words
+    uint64_t t0, t1, t2, t3;   // target (256-bit LE), as 4 u64 words
+    uint64_t timestamp;        // header timestamp
+    uint64_t n_chunks;         // total canonical chunks in the weight blob
+    uint64_t start_nonce;      // first nonce of this batch
+    uint64_t shard_mask;       // chunks_per_shard - 1 (chunks_per_shard is a power of two)
+    uint64_t mod_magic;        // floor(2^64 / n_chunks) — fast 64-bit modulo via mul_hi
+    uint k;                    // POM_WALK_STEPS (256)
+    uint batch;                // number of nonces in this dispatch
+    uint shard_shift;          // log2(chunks_per_shard)
+} pc;
+
+// splitmix64 finalizer — exactly `pom::mix64`. u64 multiply wraps (modular), matching wrapping_mul.
+uint64_t mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9UL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebUL;
+    x ^= x >> 31;
+    return x;
+}
+
+// High 64 bits of a 64x64 unsigned multiply. Decompose into 32-bit partial products —
+// RDNA2 has no native 64-bit multiply-high, but this is still ~2-3x faster than the
+// microcoded 64-bit division loop the driver emits for `%`.
+uint64_t mul_hi(uint64_t a, uint64_t b) {
+    uint64_t a_lo = a & 0xFFFFFFFFu;
+    uint64_t a_hi = a >> 32;
+    uint64_t b_lo = b & 0xFFFFFFFFu;
+    uint64_t b_hi = b >> 32;
+    uint64_t p00 = a_lo * b_lo;
+    uint64_t p01 = a_lo * b_hi;
+    uint64_t p10 = a_hi * b_lo;
+    uint64_t p11 = a_hi * b_hi;
+    uint64_t mid = (p00 >> 32) + uint(p01) + uint(p10);
+    return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
+// Fast 64-bit modulo via multiply-high (Granlund-Montgomery style). Replaces `%` which
+// triggers a microcoded division loop on RDNA2 (~120+ cycles). pc.mod_magic is
+// floor(2^64 / pc.n_chunks), precomputed on the host.  floor (not ceil) guarantees
+// mul_hi(x, mod_magic) <= floor(x / n_chunks) — never overshoots — so the single
+// correction branch always suffices (no unsigned-wrap disaster).
+uint64_t fast_mod(uint64_t x) {
+    uint64_t q = mul_hi(x, pc.mod_magic);
+    uint64_t r = x - q * pc.n_chunks;
+    if (r >= pc.n_chunks) r -= pc.n_chunks;
+    return r;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    uint64_t nonce = pc.start_nonce + uint64_t(idx);
+
+    // pom_block_seed: mix64-fold of (nonce, timestamp, pre_pow_hash words).
+    uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
+    state = mix64(state ^ pc.timestamp);
+    state = mix64(state ^ pc.p0);
+    state = mix64(state ^ pc.p1);
+    state = mix64(state ^ pc.p2);
+    state = mix64(state ^ pc.p3);
+
+    // walk_final: K data-dependent reads. off = state % n_chunks; fold the chunk; repeat.
+    // The modulo uses fast_mod (mul_hi, no division) for ~2-3x speedup on RDNA-series GPUs.
+    // Map the chunk to its shard (shift) and in-shard chunk (mask), then address the 32-byte chunk
+    // by advancing that shard's buffer_reference pointer in 64-bit address space (`local * 32` stays
+    // within a ≤1 GiB shard). Each chunk is loaded as a single u64vec4 (4 × uint64_t = 32 bytes),
+    // coalesced into one 32-byte read instead of four 8-byte reads.
+    uint64_t off = fast_mod(state);
+    for (uint i = 0u; i < pc.k; ++i) {
+        uint shard = uint(off >> pc.shard_shift);
+        uint64_t local = off & pc.shard_mask;
+        Shard chunk = Shard(SHARDS.addr[shard] + local * 32UL);
+        u64vec4 v = chunk.chunks[0];
+        uint64_t h = state ^ v.x ^ v.y ^ v.z ^ v.w;
+        state = mix64(h);
+        off = fast_mod(state);
+    }
+
+    // pom_pow_value: 4 keyed mix64 folds → 256-bit LE value as words o0..o3 (o0 = bytes 0..8).
+    uint64_t o0 = mix64(state ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+    uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+    uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+    uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+
+    // le_leq(pow, target): unsigned 256-bit LE compare, most-significant word (o3) first.
+    bool le;
+    if (o3 != pc.t3) { le = o3 < pc.t3; }
+    else if (o2 != pc.t2) { le = o2 < pc.t2; }
+    else if (o1 != pc.t1) { le = o1 < pc.t1; }
+    else if (o0 != pc.t0) { le = o0 < pc.t0; }
+    else { le = true; }
+
+    if (le) {
+        atomicMin(OUT.offset, idx);
+    }
+}

@@ -1,0 +1,198 @@
+use clap::Parser;
+use log::LevelFilter;
+
+use crate::Error;
+
+#[derive(Parser, Debug)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers (default: Dolphin-8B — RTX 3060 12GB / 3070 / 3080):\n  --very-light Qwen3-1.7B-abliterated — 4GB+ GPU, smallest tier\n  --light      Gemma-3-4B only — RTX 3060 6GB or any GPU\n  (default)    Gemma-3-4B + Dolphin-3.0-Llama-3.1-8B — RTX 3060 12GB / 3070 / 3080\n  --high       + Qwen3-32B (Q4_K_M) — RTX 3090 / 4090 / 5090 (24GB+)\n  --very-high  Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)", term_width = 0)]
+pub struct Opt {
+    // ── OPoI / Inference ─────────────────────────────────────────────────────
+
+    #[clap(
+        long = "very-light",
+        help = "Model tier: Qwen3-1.7B-abliterated — 4GB+ GPU, smallest tier (post-H2)",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["light", "high", "very_high"]
+    )]
+    pub very_light: bool,
+
+    #[clap(
+        long = "light",
+        help = "Model tier: Gemma-3-4B only — any GPU (6GB+ VRAM)",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["very_light", "high", "very_high"]
+    )]
+    pub light: bool,
+
+    #[clap(
+        long = "high",
+        help = "Model tier: Gemma-3-4B + Dolphin-8B + Qwen3-32B (Q4_K_M) — RTX 3090 / 4090 / 5090 (24GB+)",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["very_light", "light", "very_high"]
+    )]
+    pub high: bool,
+
+    #[clap(
+        long = "very-high",
+        help = "Model tier: Llama-3.3-70B — Q4 48GB (RTX 6000 Ada / A6000 / L40S) → Q2_K_L 32GB / RTX 5090 post-H2",
+        help_heading = "OPoI / Inference",
+        conflicts_with_all = &["very_light", "light", "high"]
+    )]
+    pub very_high: bool,
+
+    #[clap(
+        long = "ipfs-url",
+        help = "IPFS Kubo API URL for uploading inference results",
+        help_heading = "OPoI / Inference",
+        default_value = "http://127.0.0.1:5001"
+    )]
+    pub ipfs_url: String,
+
+    #[clap(
+        long = "escrow-key-file",
+        help = "Path to the OPoI escrow private key file (auto-generated if absent)",
+        help_heading = "OPoI / Inference",
+        default_value = "escrow.key"
+    )]
+    pub escrow_key_file: String,
+
+    #[clap(
+        long = "escrow-state-file",
+        help = "Path to the escrow claim state file",
+        help_heading = "OPoI / Inference",
+        default_value = "escrow_state.json"
+    )]
+    pub escrow_state_file: String,
+
+    #[clap(
+        long = "recover-escrow",
+        help = "Rebuild escrow_state.json by querying the Keryx public API. Exits after recovery.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub recover_escrow: bool,
+
+    #[clap(
+        long = "recover-escrow-api",
+        help = "Base URL of the Keryx API to use for escrow recovery",
+        help_heading = "OPoI / Inference",
+        default_value = "https://keryx-labs.com"
+    )]
+    pub recover_escrow_api: String,
+
+    // ── Mining ────────────────────────────────────────────────────────────────
+
+    #[clap(short, long, help = "Enable debug logging level")]
+    pub debug: bool,
+
+    #[clap(short = 'a', long = "mining-address", help = "The Keryx address for the miner reward")]
+    pub mining_address: Option<String>,
+
+    #[clap(short = 's', long = "keryxd-address", default_value = "127.0.0.1", help = "The IP of the keryxd instance")]
+    pub keryxd_address: String,
+
+    #[clap(long = "worker", default_value = "mac", help = "Pool worker name (sent as address.worker in the stratum login)")]
+    pub worker: String,
+
+    #[clap(long = "devfund-percent", help = "The percentage of blocks to send to the devfund (minimum 2%)", default_value = "2", parse(try_from_str = parse_devfund_percent))]
+    pub devfund_percent: u16,
+
+    #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22211]")]
+    port: Option<u16>,
+
+    #[clap(long, help = "Use testnet instead of mainnet [default: false]")]
+    testnet: bool,
+
+    #[clap(short = 't', long = "threads", help = "Amount of CPU miner threads to launch [default: 0]")]
+    pub num_threads: Option<u16>,
+
+    #[clap(
+        long = "mine-when-not-synced",
+        help = "Mine even when keryxd says it is not synced",
+        long_help = "Mine even when keryxd says it is not synced, only useful when passing `--allow-submit-block-when-not-synced` to keryxd  [default: false]"
+    )]
+    pub mine_when_not_synced: bool,
+
+    #[clap(skip)]
+    pub devfund_address: String,
+}
+
+fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
+    let err = "devfund-percent should be --devfund-percent=XX.YY up to 2 numbers after the dot";
+    let mut splited = s.split('.');
+    let prefix = splited.next().ok_or(err)?;
+    // if there's no postfix then it's 0.
+    let postfix = splited.next().ok_or(err).unwrap_or("0");
+    // error if there's more than a single dot
+    if splited.next().is_some() {
+        return Err(err);
+    };
+    // error if there are more than 2 numbers before or after the dot
+    if prefix.len() > 2 || postfix.len() > 2 {
+        return Err(err);
+    }
+    let postfix: u16 = postfix.parse().map_err(|_| err)?;
+    let prefix: u16 = prefix.parse().map_err(|_| err)?;
+    // can't be more than 99.99%,
+    if prefix >= 100 || postfix >= 100 {
+        return Err(err);
+    }
+    if prefix < 2 {
+        // Force at least 2 percent
+        return Ok(200u16);
+    }
+    // DevFund is out of 10_000
+    Ok(prefix * 100 + postfix)
+}
+
+impl Opt {
+    pub fn process(&mut self) -> Result<(), Error> {
+        if self.recover_escrow {
+            return Ok(());
+        }
+        if self.mining_address.is_none() {
+            return Err("--mining-address is required".into());
+        }
+        if self.keryxd_address.is_empty() {
+            self.keryxd_address = "127.0.0.1".to_string();
+        }
+
+        if !self.keryxd_address.contains("://") {
+            let port_str = self.port().to_string();
+            let (keryxd, port) = match self.keryxd_address.contains(':') {
+                true => self.keryxd_address.split_once(':').expect("We checked for `:`"),
+                false => (self.keryxd_address.as_str(), port_str.as_str()),
+            };
+            self.keryxd_address = format!("grpc://{}:{}", keryxd, port);
+        }
+        log::info!("keryxd address: {}", self.keryxd_address);
+
+        if self.num_threads.is_none() {
+            self.num_threads = Some(0);
+        }
+
+        let miner_network = self.mining_address.as_deref().and_then(|a| a.split(':').next());
+        self.devfund_address = String::from("keryx:qpcptntu45n0xtyq60apnwnhpkta0ujzt5sy3uk5v6nrjvxlqhamjyc882jj3");
+        let devfund_network = self.devfund_address.split(':').next();
+        if miner_network.is_some() && devfund_network.is_some() && miner_network != devfund_network {
+            self.devfund_percent = 0;
+            log::info!(
+                "Mining address ({}) and devfund ({}) are not from the same network. Disabling devfund.",
+                miner_network.unwrap(),
+                devfund_network.unwrap()
+            )
+        }
+        Ok(())
+    }
+
+    fn port(&mut self) -> u16 {
+        *self.port.get_or_insert(if self.testnet { 22211 } else { 22110 })
+    }
+
+    pub fn log_level(&self) -> LevelFilter {
+        if self.debug {
+            LevelFilter::Debug
+        } else {
+            LevelFilter::Info
+        }
+    }
+}

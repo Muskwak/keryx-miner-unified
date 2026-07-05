@@ -1,0 +1,223 @@
+#version 460
+// Keryx kHeavyHash (legacy PoW) — Vulkan compute port. BYTE-IDENTICAL to the host path
+// State::calculate_pow = PowHasher.finalize_with_nonce -> Matrix.heavy_hash:
+//   1. PowHash  : cSHAKE256("ProofOfWorkHash") sponge over (pre_pow_hash||time||0^32||nonce)
+//   2. matmul   : 64x64 4-bit matrix * the 64 nibbles of the PoW hash, recombined to 32 bytes
+//   3. wave_mix : 4-round ARX (consensus matrix.rs)
+//   4. HeavyHash: cSHAKE256("HeavyHash") sponge over the wave-mixed 32 bytes
+//   5. compare  : final <= target  (== host State::check_pow)
+// The matrix is generated host-side (Matrix::generate, salt-versioned) and uploaded; the kernel
+// only consumes it — so no PRNG/rank-check is needed on the GPU.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 256) in;
+
+// 64x64 matrix of 4-bit entries, packed 4 row-major entries per u32 (entry e at byte e%4) — the
+// layout the 4x8-bit packed dot product consumes. 64x64 entries => 1024 u32.
+layout(std430, binding = 0) readonly buffer Matrix { uint m[]; } MAT;
+// Lowest winning batch offset (nonce - start); host inits to 0xFFFFFFFF.
+layout(std430, binding = 1) buffer Winner { uint offset; } OUT;
+
+// The matrix is reused by every nonce, so cache it once per workgroup in shared memory (LDS) and
+// read it from there instead of from global memory in the inner loop.
+shared uint matLds[1024];
+
+layout(push_constant) uniform Push {
+    uint64_t header[9];   // pre_pow_hash(4) || timestamp(1) || 0^32 (4)  — the 72-byte pow header
+    uint64_t target[4];   // 256-bit target, little-endian words (word[3] most significant)
+    uint64_t start_nonce;
+    uint64_t nonce_mask;  // bits the miner controls (full = solo; a low-bit sub-range for pools)
+    uint64_t nonce_fixed; // pool extranonce in the high bits (0 for solo)
+    uint batch;
+} pc;
+
+// cSHAKE256("ProofOfWorkHash") / cSHAKE256("HeavyHash") absorbed initial states (== Rust
+// PowHasher::INITIAL_STATE / HeavyHasher::INITIAL_STATE, with the domain + padding folded in).
+const uint64_t powP[25] = uint64_t[25](
+    1242148031264380989UL, 3008272977830772284UL, 2188519011337848018UL, 1992179434288343456UL, 8876506674959887717UL,
+    5399642050693751366UL, 1745875063082670864UL, 8605242046444978844UL, 17936695144567157056UL, 3343109343542796272UL,
+    1123092876221303306UL, 4963925045340115282UL, 17037383077651887893UL, 16629644495023626889UL, 12833675776649114147UL,
+    3784524041015224902UL, 1082795874807940378UL, 13952716920571277634UL, 13411128033953605860UL, 15060696040649351053UL,
+    9928834659948351306UL, 5237849264682708699UL, 12825353012139217522UL, 6706187291358897596UL, 196324915476054915UL);
+const uint64_t heavyP[25] = uint64_t[25](
+    4239941492252378377UL, 8746723911537738262UL, 8796936657246353646UL, 1272090201925444760UL, 16654558671554924250UL,
+    8270816933120786537UL, 13907396207649043898UL, 6782861118970774626UL, 9239690602118867528UL, 11582319943599406348UL,
+    17596056728278508070UL, 15212962468105129023UL, 7812475424661425213UL, 3370482334374859748UL, 5690099369266491460UL,
+    8596393687355028144UL, 570094237299545110UL, 9119540418498120711UL, 16901969272480492857UL, 13372017233735502424UL,
+    14372891883993151831UL, 5171152063242093102UL, 10573107899694386186UL, 6096431547456407061UL, 1592359455985097269UL);
+
+const uint64_t RC[24] = uint64_t[24](
+    0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL, 0x8000000080008000UL,
+    0x000000000000808bUL, 0x0000000080000001UL, 0x8000000080008081UL, 0x8000000000008009UL,
+    0x000000000000008aUL, 0x0000000000000088UL, 0x0000000080008009UL, 0x000000008000000aUL,
+    0x000000008000808bUL, 0x800000000000008bUL, 0x8000000000008089UL, 0x8000000000008003UL,
+    0x8000000000008002UL, 0x8000000000000080UL, 0x000000000000800aUL, 0x800000008000000aUL,
+    0x8000000080008081UL, 0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL);
+const uint64_t WAVE_MIX_KEYS[4] =
+    uint64_t[4](0x9e3779b97f4a7c15UL, 0x6c62272e07bb0142UL, 0xb5ad4eceda1ce2a9UL, 0x243f6a8885a308d3UL);
+
+uint64_t rotl64(uint64_t x, uint r) {
+    return (x << r) | (x >> (64u - r));
+}
+
+// Keccak-f[1600] (FIPS 202) — high-ILP "B-array" round: every rho/pi lane and every chi output is
+// computed independently (no serial carried-t dependency chain), so the compiler can extract
+// instruction-level parallelism / RDNA3 dual-issue. Bit-for-bit identical to the `keccak` crate.
+void keccakf(inout uint64_t a[25]) {
+    for (uint round = 0u; round < 24u; ++round) {
+        // Theta
+        uint64_t c0 = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
+        uint64_t c1 = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21];
+        uint64_t c2 = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22];
+        uint64_t c3 = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23];
+        uint64_t c4 = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24];
+        uint64_t d0 = c4 ^ rotl64(c1, 1u);
+        uint64_t d1 = c0 ^ rotl64(c2, 1u);
+        uint64_t d2 = c1 ^ rotl64(c3, 1u);
+        uint64_t d3 = c2 ^ rotl64(c4, 1u);
+        uint64_t d4 = c3 ^ rotl64(c0, 1u);
+        a[0] ^= d0; a[5] ^= d0; a[10] ^= d0; a[15] ^= d0; a[20] ^= d0;
+        a[1] ^= d1; a[6] ^= d1; a[11] ^= d1; a[16] ^= d1; a[21] ^= d1;
+        a[2] ^= d2; a[7] ^= d2; a[12] ^= d2; a[17] ^= d2; a[22] ^= d2;
+        a[3] ^= d3; a[8] ^= d3; a[13] ^= d3; a[18] ^= d3; a[23] ^= d3;
+        a[4] ^= d4; a[9] ^= d4; a[14] ^= d4; a[19] ^= d4; a[24] ^= d4;
+
+        // Rho + Pi → 25 independent rotated lanes
+        uint64_t b0  = a[0];
+        uint64_t b1  = rotl64(a[6],  44u);
+        uint64_t b2  = rotl64(a[12], 43u);
+        uint64_t b3  = rotl64(a[18], 21u);
+        uint64_t b4  = rotl64(a[24], 14u);
+        uint64_t b5  = rotl64(a[3],  28u);
+        uint64_t b6  = rotl64(a[9],  20u);
+        uint64_t b7  = rotl64(a[10],  3u);
+        uint64_t b8  = rotl64(a[16], 45u);
+        uint64_t b9  = rotl64(a[22], 61u);
+        uint64_t b10 = rotl64(a[1],   1u);
+        uint64_t b11 = rotl64(a[7],   6u);
+        uint64_t b12 = rotl64(a[13], 25u);
+        uint64_t b13 = rotl64(a[19],  8u);
+        uint64_t b14 = rotl64(a[20], 18u);
+        uint64_t b15 = rotl64(a[4],  27u);
+        uint64_t b16 = rotl64(a[5],  36u);
+        uint64_t b17 = rotl64(a[11], 10u);
+        uint64_t b18 = rotl64(a[17], 15u);
+        uint64_t b19 = rotl64(a[23], 56u);
+        uint64_t b20 = rotl64(a[2],  62u);
+        uint64_t b21 = rotl64(a[8],  55u);
+        uint64_t b22 = rotl64(a[14], 39u);
+        uint64_t b23 = rotl64(a[15], 41u);
+        uint64_t b24 = rotl64(a[21],  2u);
+
+        // Chi (25 independent) + Iota
+        a[0]  = b0  ^ ((~b1)  & b2);
+        a[1]  = b1  ^ ((~b2)  & b3);
+        a[2]  = b2  ^ ((~b3)  & b4);
+        a[3]  = b3  ^ ((~b4)  & b0);
+        a[4]  = b4  ^ ((~b0)  & b1);
+        a[5]  = b5  ^ ((~b6)  & b7);
+        a[6]  = b6  ^ ((~b7)  & b8);
+        a[7]  = b7  ^ ((~b8)  & b9);
+        a[8]  = b8  ^ ((~b9)  & b5);
+        a[9]  = b9  ^ ((~b5)  & b6);
+        a[10] = b10 ^ ((~b11) & b12);
+        a[11] = b11 ^ ((~b12) & b13);
+        a[12] = b12 ^ ((~b13) & b14);
+        a[13] = b13 ^ ((~b14) & b10);
+        a[14] = b14 ^ ((~b10) & b11);
+        a[15] = b15 ^ ((~b16) & b17);
+        a[16] = b16 ^ ((~b17) & b18);
+        a[17] = b17 ^ ((~b18) & b19);
+        a[18] = b18 ^ ((~b19) & b15);
+        a[19] = b19 ^ ((~b15) & b16);
+        a[20] = b20 ^ ((~b21) & b22);
+        a[21] = b21 ^ ((~b22) & b23);
+        a[22] = b22 ^ ((~b23) & b24);
+        a[23] = b23 ^ ((~b24) & b20);
+        a[24] = b24 ^ ((~b20) & b21);
+        a[0] ^= RC[round];
+    }
+}
+
+void main() {
+    // Cooperatively cache the packed matrix in LDS. ALL threads run this and the barrier BEFORE
+    // any early-out, so a partially-filled final workgroup cannot deadlock on the barrier.
+    for (uint t = gl_LocalInvocationID.x; t < 1024u; t += gl_WorkGroupSize.x) {
+        matLds[t] = MAT.m[t];
+    }
+    barrier();
+
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    // Effective nonce = miner-controlled bits of (start + idx), OR'd with the pool extranonce.
+    // For solo mining nonce_mask is all-ones and nonce_fixed is 0, so this is just start + idx.
+    uint64_t nonce = ((pc.start_nonce + uint64_t(idx)) & pc.nonce_mask) | pc.nonce_fixed;
+
+    // 1. PowHash sponge: a = powP ^ (header || nonce), keccakf, take first 4 words.
+    uint64_t a[25];
+    for (uint i = 0u; i < 9u; ++i) a[i] = powP[i] ^ pc.header[i];
+    a[9] = powP[9] ^ nonce;
+    for (uint i = 10u; i < 25u; ++i) a[i] = powP[i];
+    keccakf(a);
+    uint64_t pw[4] = uint64_t[4](a[0], a[1], a[2], a[3]); // PoW hash, 32 LE bytes
+
+    // 2. Pack the 64 PoW-hash nibbles (high nibble first) into 16 u32 (4 per word) so each lines
+    //    up byte-for-byte with a packed matrix word, then run the 64x64 4-bit matmul as 4x8-bit
+    //    packed dot products. Entry j multiplies nibble j, exactly as the scalar form did.
+    uint nibv[16];
+    for (uint k = 0u; k < 16u; ++k) {
+        uint v = 0u;
+        for (uint q = 0u; q < 4u; ++q) {
+            uint nidx = 4u * k + q;                                 // nibble index 0..63
+            uint bi = nidx >> 1u;                                   // PoW-hash byte holding it
+            uint b = uint((pw[bi >> 3u] >> (8u * (bi & 7u))) & 0xFFUL);
+            uint nibble = ((nidx & 1u) == 0u) ? (b >> 4u) : (b & 0x0Fu); // even = high nibble
+            v |= nibble << (8u * q);
+        }
+        nibv[k] = v;
+    }
+    // Matmul → straight into the 4 LE output words (no 32-byte scratch array). Output byte i lands
+    // in word i/8 at byte i%8, XOR'd with the PoW-hash byte — exactly the scalar form, fewer VGPRs.
+    uint64_t w[4] = uint64_t[4](0UL, 0UL, 0UL, 0UL);
+    for (uint i = 0u; i < 32u; ++i) {
+        uint sum1 = 0u;
+        uint sum2 = 0u;
+        for (uint k = 0u; k < 16u; ++k) {
+            sum1 += dotPacked4x8EXT(matLds[(2u * i) * 16u + k], nibv[k]);
+            sum2 += dotPacked4x8EXT(matLds[(2u * i + 1u) * 16u + k], nibv[k]);
+        }
+        uint matbyte = ((sum1 >> 10u) << 4u) | (sum2 >> 10u);
+        uint hbyte = uint((pw[i >> 3u] >> (8u * (i & 7u))) & 0xFFUL);
+        w[i >> 3u] |= uint64_t((matbyte ^ hbyte) & 0xFFu) << (8u * (i & 7u));
+    }
+
+    // 3. wave_mix: 4-round ARX (rotations 17,47,31,13; pairs (w0,w2) then (w1,w3)).
+    for (uint r = 0u; r < 4u; ++r) {
+        w[0] = rotl64(w[0] + w[1], 17u) ^ WAVE_MIX_KEYS[r & 3u];
+        w[2] = rotl64(w[2] + w[3], 47u) ^ WAVE_MIX_KEYS[(r + 2u) & 3u];
+        w[1] = rotl64(w[1] + w[2], 31u) ^ WAVE_MIX_KEYS[(r + 1u) & 3u];
+        w[3] = rotl64(w[3] + w[0], 13u) ^ WAVE_MIX_KEYS[(r + 3u) & 3u];
+    }
+
+    // 4. HeavyHash sponge over the wave-mixed 32 bytes — reuse `a` (the PoW-hash state is dead now)
+    //    instead of a second 25-word state array, to keep register pressure down.
+    for (uint i = 0u; i < 4u; ++i) a[i] = heavyP[i] ^ w[i];
+    for (uint i = 4u; i < 25u; ++i) a[i] = heavyP[i];
+    keccakf(a);
+    uint64_t f0 = a[0], f1 = a[1], f2 = a[2], f3 = a[3];
+
+    // 5. final <= target  (unsigned 256-bit LE, word[3] most significant).
+    bool le;
+    if (f3 != pc.target[3]) { le = f3 < pc.target[3]; }
+    else if (f2 != pc.target[2]) { le = f2 < pc.target[2]; }
+    else if (f1 != pc.target[1]) { le = f1 < pc.target[1]; }
+    else if (f0 != pc.target[0]) { le = f0 < pc.target[0]; }
+    else { le = true; }
+
+    if (le) {
+        atomicMin(OUT.offset, idx);
+    }
+}

@@ -1,0 +1,39 @@
+#version 460
+// Keryx zero-dup consensus guard: fetch ONE canonical 32-byte chunk from the shared
+// (ggml-resident) weight tensors through the same prefix-table + buffer-device-address
+// path pom_walk_prefix.comp uses. The host samples random chunks and compares them
+// byte-for-byte against the GGUF-backed possession index BEFORE the shared walk is
+// allowed to mine — any layout/addressing mismatch would otherwise silently produce
+// proofs the node rejects.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 1) in;
+
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Chunk {
+    uint64_t words[];
+};
+
+layout(std430, binding = 0) writeonly buffer Out { uint64_t words[4]; } OUT;
+layout(std430, binding = 1) readonly buffer Prefix { uint64_t start[]; } PREFIX;
+layout(std430, binding = 2) readonly buffer Addrs  { uint64_t addr[];  } ADDRS;
+
+layout(push_constant) uniform Push {
+    uint64_t chunk;    // canonical chunk index to fetch
+    uint n_tensors;
+} pc;
+
+void main() {
+    uint lo = 0u;
+    uint hi = pc.n_tensors;
+    while (hi - lo > 1u) {
+        uint mid = (lo + hi) / 2u;
+        if (PREFIX.start[mid] <= pc.chunk) { lo = mid; } else { hi = mid; }
+    }
+    uint64_t local = pc.chunk - PREFIX.start[lo];
+    Chunk c = Chunk(ADDRS.addr[lo] + local * 32UL);
+    OUT.words[0] = c.words[0];
+    OUT.words[1] = c.words[1];
+    OUT.words[2] = c.words[2];
+    OUT.words[3] = c.words[3];
+}

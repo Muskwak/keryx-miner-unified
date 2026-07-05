@@ -1,0 +1,116 @@
+#version 460
+// BENCH VARIANT of pom_walk.comp — byte-identical RESULT, but the two data-dependent
+// `state % n_chunks` reductions are replaced with a precomputed magic-number division
+// (libdivide u64 "branchfree": one 64x64->high multiply + a shift-add + a shift, then
+// off = n - q*n_chunks). n_chunks is fixed per mining tier, so the host precomputes the
+// magic/shift and passes them as push constants. RDNA3 has no native 64-bit integer
+// divide, so a hardware `%` lowers to a long emulated sequence; this trades it for ~5
+// multiplies. Whether that helps depends on how ALU-bound vs memory-latency-bound the
+// walk is — that is exactly what the bench measures. local_size_x stays 64 so the ONLY
+// difference from baseline is the modulo. Used only by the `bench` feature.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, buffer_reference, buffer_reference_align = 8) readonly buffer Shard {
+    uint64_t words[];
+};
+
+layout(std430, binding = 0) buffer Winner { uint offset; } OUT;
+layout(std430, binding = 1) readonly buffer ShardAddrs { uint64_t addr[]; } SHARDS;
+
+// Push layout MUST match `MagicPush` in bench.rs (std430: thirteen u64 at 0..104, then
+// five u32 at 104,108,112,116,120; 124 bytes, padded to 128 = AMD maxPushConstantsSize).
+layout(push_constant) uniform Push {
+    uint64_t p0, p1, p2, p3;
+    uint64_t t0, t1, t2, t3;
+    uint64_t timestamp;
+    uint64_t n_chunks;
+    uint64_t start_nonce;
+    uint64_t shard_mask;
+    uint64_t magic;        // libdivide branchfree magic for n_chunks
+    uint k;
+    uint batch;
+    uint shard_shift;
+    uint magic_shift;      // = floor(log2(n_chunks))
+    uint is_pow2;          // 1 => n_chunks is a power of two (use mask fast-path)
+} pc;
+
+uint64_t mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9UL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebUL;
+    x ^= x >> 31;
+    return x;
+}
+
+// High 64 bits of the 128-bit product a*b, via 32-bit limbs (RDNA3 has no 64x64->128).
+uint64_t mulhi64(uint64_t a, uint64_t b) {
+    uint64_t al = a & 0xFFFFFFFFUL, ah = a >> 32;
+    uint64_t bl = b & 0xFFFFFFFFUL, bh = b >> 32;
+    uint64_t ll = al * bl;
+    uint64_t lh = al * bh;
+    uint64_t hl = ah * bl;
+    uint64_t hh = ah * bh;
+    uint64_t cross = (ll >> 32) + (lh & 0xFFFFFFFFUL) + (hl & 0xFFFFFFFFUL);
+    return hh + (lh >> 32) + (hl >> 32) + (cross >> 32);
+}
+
+// Exactly `n % n_chunks` for the tier's fixed n_chunks. Branchfree libdivide u64 quotient,
+// then subtract. Verified bit-exact against hardware `%` on the host before dispatch.
+uint64_t mod_magic(uint64_t n) {
+    if (pc.is_pow2 != 0u) {
+        return n & (pc.n_chunks - 1UL);
+    }
+    uint64_t q = mulhi64(pc.magic, n);
+    uint64_t t = ((n - q) >> 1) + q;
+    q = t >> pc.magic_shift;          // q == n / n_chunks
+    return n - q * pc.n_chunks;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.batch) {
+        return;
+    }
+    uint64_t nonce = pc.start_nonce + uint64_t(idx);
+
+    uint64_t state = mix64(nonce ^ 0x4B65727978531UL);
+    state = mix64(state ^ pc.timestamp);
+    state = mix64(state ^ pc.p0);
+    state = mix64(state ^ pc.p1);
+    state = mix64(state ^ pc.p2);
+    state = mix64(state ^ pc.p3);
+
+    uint64_t off = mod_magic(state);
+    for (uint i = 0u; i < pc.k; ++i) {
+        uint shard = uint(off >> pc.shard_shift);
+        uint64_t local = off & pc.shard_mask;
+        Shard chunk = Shard(SHARDS.addr[shard] + local * 32UL);
+        uint64_t h = state;
+        h ^= chunk.words[0];
+        h ^= chunk.words[1];
+        h ^= chunk.words[2];
+        h ^= chunk.words[3];
+        state = mix64(h);
+        off = mod_magic(state);
+    }
+
+    uint64_t o0 = mix64(state ^ pc.p0 ^ 0x9E3779B97F4A7C15UL);
+    uint64_t o1 = mix64(o0 ^ pc.p1 ^ 0xC2B2AE3D27D4EB4FUL);
+    uint64_t o2 = mix64(o1 ^ pc.p2 ^ 0x165667B19E3779F9UL);
+    uint64_t o3 = mix64(o2 ^ pc.p3 ^ 0xD6E8FEB86659FD93UL);
+
+    bool le;
+    if (o3 != pc.t3) { le = o3 < pc.t3; }
+    else if (o2 != pc.t2) { le = o2 < pc.t2; }
+    else if (o1 != pc.t1) { le = o1 < pc.t1; }
+    else if (o0 != pc.t0) { le = o0 < pc.t0; }
+    else { le = true; }
+
+    if (le) {
+        atomicMin(OUT.offset, idx);
+    }
+}

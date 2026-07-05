@@ -1,0 +1,52 @@
+name: Build and upload assets
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Keryx miner — Apple Silicon (Metal) fork release.
+#
+# Apple Silicon only: a single self-contained keryx-miner binary using candle's Metal backend and
+# the Metal PoM walk. macos-latest is arm64, so aarch64-apple-darwin is a native build. The in-tree
+# CUDA/OpenCL plugins exist only for upstream-backport parity and are not built or shipped here.
+
+jobs:
+  build:
+    name: Build macOS (Metal, Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: rustfs/setup-protoc@v3.0.1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (Metal, aarch64-apple-darwin)
+        run: |
+          cargo build --release --target aarch64-apple-darwin --bin keryx-miner
+          asset="keryx-miner-${{ github.event.release.tag_name }}-metal-osx-arm64"
+          strip target/aarch64-apple-darwin/release/keryx-miner
+          mkdir "$asset"
+          cp target/aarch64-apple-darwin/release/keryx-miner "$asset/keryx-miner"
+          cp README.md "$asset/" 2>/dev/null || true
+          cp start-mining-mac.sh "$asset/" 2>/dev/null || true
+          tar czvf "$asset.tgz" "$asset"
+          echo "ASSET=$asset.tgz" >> "$GITHUB_ENV"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.ASSET }}
