@@ -169,7 +169,7 @@ Models load on demand and are cached between requests. Mining pauses during infe
 
 ## Dev Fund
 
-2% of mining rewards support development by default.
+2% of mining rewards supports unified fork development by default, can be disabled.
 
 ```bash
 --devfund-percent XX.YY
