@@ -14,6 +14,7 @@ extern bool keryx_miner_set_mining_address(const char *address);
 extern bool keryx_miner_start(void);
 extern void keryx_miner_stop(void);
 extern char *keryx_miner_status(void);
+extern char *keryx_miner_bench_metal(unsigned long long blob_mb);
 extern void keryx_miner_free_string(char *s);
 
 #endif /* Bridge_h */

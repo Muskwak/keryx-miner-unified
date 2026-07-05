@@ -960,6 +960,21 @@ pub extern "C" fn keryx_miner_status() -> *mut std::ffi::c_char {
     CString::new(json).unwrap_or_default().into_raw()
 }
 
+/// Run a self-contained Metal PoM-walk benchmark (no node, no model download) and return a
+/// human-readable multi-line result string (free with `keryx_miner_free_string`). Blocks for a few
+/// seconds — call it off the main thread from Swift. `blob_mb` sizes the synthetic weight blob
+/// (0 = default 256 MiB, safe under iOS's per-app memory limit yet far larger than any GPU cache,
+/// so the walk stays cache-defeating). This measures the device's raw PoM walk throughput so
+/// hardware can be compared without setting up mining.
+#[no_mangle]
+pub extern "C" fn keryx_miner_bench_metal(blob_mb: u64) -> *mut std::ffi::c_char {
+    let blob_mb = if blob_mb == 0 { 256 } else { blob_mb };
+    // 1<<20 nonces/launch keeps each Metal dispatch short (well under any watchdog); 6 launches
+    // averages out scheduling jitter.
+    let result = pom_gpu::bench(blob_mb, 1 << 20, 6);
+    CString::new(result).unwrap_or_default().into_raw()
+}
+
 #[no_mangle]
 pub extern "C" fn keryx_miner_free_string(s: *mut std::ffi::c_char) {
     if !s.is_null() {

@@ -80,6 +80,60 @@ struct Uniforms {
 impl PomGpuMiner {
     /// Load the mining model's GGUF into a candle Metal device and build the bindless walk
     /// tables. Heavy — call once per (device, model).
+    /// Build a benchmark miner over a SYNTHETIC single-buffer weight blob of `blob_bytes` — no GGUF,
+    /// no model download. Uses the exact same kernel/pipeline/dispatch as production `load`, so the
+    /// MH/s it measures is representative of real mining throughput on this device. The blob is one
+    /// contiguous shared-storage buffer (`n_tensors = 1`), filled with a cheap pseudo-random pattern
+    /// so the walk's data-dependent reads hit real (non-zero) memory traffic.
+    pub fn synthetic(device_id: usize, blob_bytes: u64) -> candle_core::Result<Self> {
+        let cdev = Device::new_metal(device_id)?;
+        let mdev = match &cdev {
+            Device::Metal(m) => m.metal_device().clone(),
+            _ => return Err(candle_core::Error::Msg("PoM Metal: not a Metal device".into())),
+        };
+
+        let n_total_chunks = blob_bytes / CHUNK_BYTES as u64;
+        if n_total_chunks < 2 {
+            return Err(candle_core::Error::Msg("PoM Metal bench: blob too small".into()));
+        }
+        let blob_len = (n_total_chunks * CHUNK_BYTES as u64) as usize;
+        let blob = mdev
+            .new_buffer(blob_len, SHARED_STORAGE)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: blob buffer: {e}")))?;
+        // Fill with a cheap splitmix-ish pattern (unified memory → CPU-visible shared buffer).
+        unsafe {
+            let p = blob.contents() as *mut u64;
+            let words = blob_len / 8;
+            for i in 0..words {
+                *p.add(i) = (i as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+            }
+        }
+        let addr = blob.as_ref().gpuAddress();
+        let prefix: [u64; 2] = [0, n_total_chunks];
+        let addrs: [u64; 1] = [addr];
+
+        let prefix_buf = mdev
+            .new_buffer_with_data(prefix.as_ptr() as *const _, std::mem::size_of_val(&prefix), SHARED_STORAGE)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: prefix buffer: {e}")))?;
+        let addrs_buf = mdev
+            .new_buffer_with_data(addrs.as_ptr() as *const _, std::mem::size_of_val(&addrs), SHARED_STORAGE)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: addrs buffer: {e}")))?;
+        let library = mdev
+            .new_library_with_source(METAL_SRC, None)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: compile: {e}")))?;
+        let func = library
+            .get_function("pom_mine", None)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: get_function: {e}")))?;
+        let pipeline = mdev
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: pipeline: {e}")))?;
+        let queue = mdev
+            .new_command_queue()
+            .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: command queue: {e}")))?;
+
+        Ok(Self { device: mdev, queue, pipeline, prefix_buf, addrs_buf, resources: vec![blob], n_total_chunks, n_tensors: 1 })
+    }
+
     pub fn load(gguf_path: &str, device_id: usize) -> candle_core::Result<Self> {
         let cdev = Device::new_metal(device_id)?;
         let mdev = match &cdev {
@@ -258,6 +312,45 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
         *wi = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     }
     w
+}
+
+/// Self-contained Metal PoM-walk benchmark: builds a synthetic `blob_mb` weight blob on device 0
+/// and times the production walk kernel over `nonces` per launch × `iters` launches, with an
+/// impossible (all-zero) target so every invocation runs the full K-step walk (worst case = real
+/// mining throughput). Returns a human-readable multi-line result the app can show directly.
+/// One warmup launch is discarded before timing.
+pub fn bench(blob_mb: u64, nonces: u64, iters: u32) -> String {
+    let blob_bytes = blob_mb * 1024 * 1024;
+    let miner = match PomGpuMiner::synthetic(0, blob_bytes) {
+        Ok(m) => m,
+        Err(e) => return format!("bench failed to init: {e}"),
+    };
+    let pph = [0x5au8; 32];
+    let target = [0u8; 32]; // impossible → full walk, no early-out
+    let ts = 0xDEAD_BEEF_u64;
+
+    // Warmup (compile/first-dispatch cost excluded from timing).
+    let _ = miner.mine(&pph, ts, &target, 0, nonces);
+
+    let t0 = std::time::Instant::now();
+    for it in 0..iters as u64 {
+        if let Err(e) = miner.mine(&pph, ts, &target, it * nonces, nonces) {
+            return format!("bench dispatch failed: {e}");
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let total = nonces * iters as u64;
+    let mhs = total as f64 / secs / 1e6;
+    let dev = query_all_gpus_vram();
+    let vram = dev.first().map(|(_, mb)| *mb).unwrap_or(0);
+    format!(
+        "PoM Metal benchmark\n\
+         {:.2} MH/s\n\
+         blob {} MiB ({} chunks)\n\
+         {} nonces x {} iters in {:.2}s\n\
+         device budget {} MB",
+        mhs, blob_mb, miner.n_chunks(), nonces, iters, secs, vram
+    )
 }
 
 /// Total usable GPU memory (MB) of every Metal device, in candle's `Device::new_metal` order — the

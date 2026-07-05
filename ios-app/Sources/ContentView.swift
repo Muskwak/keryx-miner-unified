@@ -22,6 +22,9 @@ func keryx_miner_stop()
 @_silgen_name("keryx_miner_status")
 func keryx_miner_status() -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("keryx_miner_bench_metal")
+func keryx_miner_bench_metal(_ blobMb: UInt64) -> UnsafeMutablePointer<CChar>?
+
 @_silgen_name("keryx_miner_free_string")
 func keryx_miner_free_string(_ s: UnsafeMutablePointer<CChar>?)
 
@@ -32,6 +35,8 @@ struct ContentView: View {
     @State private var hashrateMhs: Double = 0.0
     @State private var logLines: [String] = ["keryx-miner iOS — ready"]
     @State private var statusTimer: Timer?
+    @State private var isBenchmarking: Bool = false
+    @State private var benchResult: String = ""
 
     var body: some View {
         NavigationView {
@@ -81,6 +86,33 @@ struct ContentView: View {
                 if isMining {
                     Text(String(format: "Hashrate: %.4f MH/s", hashrateMhs))
                         .font(.callout)
+                        .padding(.horizontal)
+                }
+
+                // Benchmark button — measures raw Metal PoM-walk throughput on this device,
+                // no node/model needed. Disabled while mining (they'd contend for the GPU).
+                Button(action: { runBenchmark() }) {
+                    HStack {
+                        if isBenchmarking {
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: "speedometer")
+                        }
+                        Text(isBenchmarking ? "Benchmarking…" : "Benchmark GPU")
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.blue)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+                }
+                .disabled(isMining || isBenchmarking)
+                .padding(.horizontal)
+
+                if !benchResult.isEmpty {
+                    Text(benchResult)
+                        .font(.system(.callout, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal)
                 }
 
@@ -151,6 +183,25 @@ struct ContentView: View {
         isMining = false
         logLines.append("Mining stopped")
         pollStatus()
+    }
+
+    func runBenchmark() {
+        isBenchmarking = true
+        benchResult = ""
+        logLines.append("Benchmark: running Metal PoM walk…")
+        // The bench blocks for a few seconds — run it off the main thread so the UI stays live.
+        DispatchQueue.global(qos: .userInitiated).async {
+            var text = "benchmark returned no result"
+            if let ptr = keryx_miner_bench_metal(0) {   // 0 = default 512 MiB blob
+                text = String(cString: ptr)
+                keryx_miner_free_string(ptr)
+            }
+            DispatchQueue.main.async {
+                benchResult = text
+                isBenchmarking = false
+                logLines.append("Benchmark: done")
+            }
+        }
     }
 
     func pollStatus() {
