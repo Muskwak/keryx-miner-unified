@@ -21,7 +21,25 @@ pub mod inference_engine;
 // set_mining_tier/device_for_model), so main.rs / miner.rs / slm.rs / ios.rs / android.rs stay
 // backend-agnostic. iOS is NOT macOS and Android is neither, so each must be listed explicitly
 // here or it would fall through to the CUDA path (which can't build on either).
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+//
+// Desktop (Linux/Windows): when the `cuda` Cargo feature is on, `pom_gpu` resolves to the CUDA
+// module (`pom_gpu.rs`, links nvcuda.dll). When `cuda` is OFF but `vulkan` is on (the AMD/Intel-
+// only build), `pom_gpu` aliases to `pom_gpu_vulkan_desktop` instead — same free-function surface
+// (the trait wrappers in pom_gpu_backends.rs already proved compatibility) — so a vulkan-only
+// desktop binary links ZERO CUDA DLLs and mines AMD/Intel cards. Both features on = the
+// heterogeneous NVIDIA+AMD binary (CUDA module is `pom_gpu`, Vulkan desktop is its own module
+// `pom_gpu_vulkan_desktop`, and MinerManager spawns threads on both backends).
+#[cfg(all(
+    feature = "cuda",
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+pub mod pom_gpu;
+#[cfg(all(
+    not(feature = "cuda"),
+    feature = "vulkan",
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+#[path = "pom_gpu_vulkan_desktop.rs"]
 pub mod pom_gpu;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[path = "pom_gpu_metal.rs"]

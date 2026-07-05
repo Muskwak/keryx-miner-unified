@@ -110,7 +110,13 @@ no-asm = ["keccak"]
 # At runtime each compiled-in backend probes its own driver (cudarc / ash / objc2-metal) and
 # contributes zero or more devices to the unified list (device.rs); a both-features build runs fine
 # on a machine with only one vendor's GPU — the other backend's probe just finds nothing.
-cuda = []
+# `cuda` activates candle's CUDA backend AND the CUDA PoM walk / PTX build. It is now a REAL gate:
+# a desktop build WITHOUT it links zero CUDA DLLs (no nvcuda.dll dependency) and routes mining +
+# inference through the Vulkan backend instead — so an AMD/Intel-only machine can run the binary.
+# candle-core/nn/transformers are declared without `cuda` in the desktop dep block below; this
+# feature turns their `cuda` sub-feature on. build.rs gates the nvcc PTX build on CARGO_FEATURE_CUDA;
+# lib.rs routes `pom_gpu` to the CUDA module only when this is set (else the Vulkan desktop module).
+cuda = ["candle-core/cuda", "candle-transformers/cuda", "candle-nn/cuda"]
 # vulkan pulls the desktop Vulkan mining module (pom_gpu_vulkan_desktop.rs) + the in-process
 # llama.cpp (Vulkan) inference engine (llm_engine.rs). Both deps are heavy (keryx-vulkan compiles
 # SPIR-V shaders; llama-cpp-2 is a C++/cmake build), so they're optional and only pulled when this
@@ -138,9 +144,14 @@ keccak = "0.1"
 # GPU inference. On macOS the vendored `candle-kernels` patch below is unused (it is CUDA-only)
 # and cargo will emit a harmless "patch not used" warning.
 [target.'cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))'.dependencies]
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-transformers = { version = "0.9", features = ["cuda"] }
-candle-nn = { version = "0.9", features = ["cuda"] }
+# NOTE: candle's `cuda` feature is NOT hardcoded here — it is turned on by the `cuda` CARGO feature
+# (see [features] above: `cuda = ["candle-core/cuda", ...]`). A `--features vulkan` build (no cuda)
+# therefore links NO CUDA runtime, so it runs on an AMD/Intel-only box; a `--features cuda,vulkan`
+# build is the heterogeneous NVIDIA+AMD binary. candle-core itself is always needed (GGUF parsing,
+# CPU device for the PoM index build, model downloads) — only its GPU backend is gated.
+candle-core = { version = "0.9" }
+candle-transformers = { version = "0.9" }
+candle-nn = { version = "0.9" }
 # Desktop Vulkan backend (AMD RDNA3 / Intel Arc), Activated by the `vulkan` Cargo
 # feature — all three Vulkan deps are `optional = true` so a CUDA-only desktop build pulls none of
 # them. The `vulkan` feature implies `dep:keryx-vulkan` + `dep:llama-cpp-2` + `dep:llama-cpp-sys-2`

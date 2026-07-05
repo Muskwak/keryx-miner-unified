@@ -168,15 +168,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // together (one binary covers an NVIDIA + AMD rig), macOS/iOS compile `metal`, Android
     // compiles `vulkan`.
     //
-    // CUDA PTX build — same target_os condition as `src/lib.rs`'s `pom_gpu` module cfg (NOT the
-    // `cuda` Cargo feature: nothing in src/ checks `cfg(feature = "cuda")`, and `pom_gpu.rs` is
-    // compiled unconditionally on desktop, so gating the PTX build behind the feature left a
-    // plain `cargo build` unable to satisfy `pom_gpu.rs`'s `include!(.../pom_ptx.rs)`). The tuned
-    // kernel + multi-arch selector come from keryx-pascal-miner; the metal fork's old single-arch
-    // PTX build is superseded.
+    // CUDA PTX build — gated on the `cuda` Cargo feature (CARGO_FEATURE_CUDA). `pom_gpu.rs` (which
+    // `include!`s the emitted `pom_ptx.rs`) is itself compiled only under `feature = "cuda"` now, so
+    // a `--features vulkan` (AMD/Intel) build compiles neither and needs no nvcc. The tuned kernel +
+    // multi-arch selector come from keryx-pascal-miner; the metal fork's old single-arch PTX build
+    // is superseded.
     let vulkan_enabled = env::var_os("CARGO_FEATURE_VULKAN").is_some();
+    let cuda_enabled = env::var_os("CARGO_FEATURE_CUDA").is_some();
 
-    if target_os != "macos" && target_os != "ios" && target_os != "android" {
+    if cuda_enabled && target_os != "macos" && target_os != "ios" && target_os != "android" {
         let out_dir = env::var("OUT_DIR")?;
         build_cuda_ptx(&out_dir)?;
     }

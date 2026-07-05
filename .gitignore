@@ -1,5 +1,7 @@
 /target
 /target-cuda
+/target-win
+target-hive/
 models/
 escrow.key
 escrow_state.json
