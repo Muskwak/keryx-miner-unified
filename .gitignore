@@ -2,6 +2,8 @@
 /target-cuda
 /target-win
 /target-win-vk
+/target-nv
+/target-launcher
 target-hive/
 models/
 escrow.key

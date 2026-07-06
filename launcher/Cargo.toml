@@ -1,0 +1,38 @@
+[package]
+name = "keryx-launcher"
+version = "0.3.8"
+edition = "2021"
+description = "Auto-detecting launcher: runs keryx-miner-nvidia on NVIDIA rigs, keryx-miner-amd on AMD/Intel-only rigs."
+
+# Single goal: detect whether an NVIDIA GPU (and driver) is present, then exec the matching
+# sibling binary with the exact same argv. This lets us ship ONE package that works on both
+# NVIDIA and AMD/Intel-only machines without a dynamically-linked mega-binary.
+#
+#   keryx-miner.exe (this launcher)
+#   keryx-miner-nvidia.exe   (cuda,vulkan build — links nvcuda.dll)
+#   keryx-miner-amd.exe      (vulkan-only build — zero CUDA links)
+#   keryxcuda.dll            (NVIDIA plugin — only loaded by the nvidia binary)
+#
+# Detection order (any one hits → NVIDIA): nvidia-smi on PATH, then the driver DLL itself.
+
+[[bin]]
+name = "keryx-miner"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+# LoadLibraryW / FreeLibrary — proves nvcuda.dll is loadable without hard-linking it.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# dlopen / dlclose on the libcuda.so.* candidates. Linux-only; macOS uses Metal (no launcher).
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

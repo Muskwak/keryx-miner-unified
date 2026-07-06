@@ -205,8 +205,8 @@ time = { version = "0.3", features = ["formatting"] }
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
 
 [workspace]
-members = ["inference", "plugins/*", "keryx-vulkan"]
-default-members = ["."]
+members = ["inference", "plugins/*", "keryx-vulkan", "launcher"]
+default-members = [".", "launcher"]
 
 # Vendored candle patches:
 #   * candle-kernels — upstream MoE bf16 WMMA kernels only compile for sm_80+,
