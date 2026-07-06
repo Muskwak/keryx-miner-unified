@@ -19,7 +19,14 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.keryx.miner.ios
         INFOPLIST_FILE: Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge.h
-        OTHER_LDFLAGS: -lkeryx_miner -lresolv -force_load $(SRCROOT)/../target/aarch64-apple-ios/release/libkeryx_miner.a
+        # LAUNCH-CRASH FIX: do NOT use `-lkeryx_miner`. The crate builds BOTH a staticlib
+        # (libkeryx_miner.a) and a cdylib (libkeryx_miner.dylib); `-l` prefers the .dylib and bakes
+        # a LC_LOAD_DYLIB into the app pointing at the BUILD MACHINE's absolute path
+        # (/Users/runner/work/.../deps/libkeryx_miner.dylib) — which doesn't exist on the device, so
+        # dyld fails to load it at launch → instant crash. `-force_load <abs path to .a>` already
+        # links the ENTIRE static archive (every symbol), so `-l` is redundant as well as harmful.
+        # `-dead_strip_dylibs` additionally drops any dylib load command nothing actually references.
+        OTHER_LDFLAGS: -lresolv -dead_strip_dylibs -force_load $(SRCROOT)/../target/aarch64-apple-ios/release/libkeryx_miner.a
         LIBRARY_SEARCH_PATHS: $(SRCROOT)/../target/aarch64-apple-ios/release
         CLANG_ENABLE_MODULES: YES
     dependencies: []
