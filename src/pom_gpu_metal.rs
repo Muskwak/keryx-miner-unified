@@ -101,8 +101,13 @@ impl PomGpuMiner {
             .new_buffer(blob_len, SHARED_STORAGE)
             .map_err(|e| candle_core::Error::Msg(format!("PoM Metal bench: blob buffer: {e}")))?;
         // Fill with a cheap splitmix-ish pattern (unified memory → CPU-visible shared buffer).
+        // Guard the pointer: a shared-storage buffer's `contents()` is non-null, but writing 256 MiB
+        // to a null pointer (if the driver ever returned one) would SIGSEGV — return an Err instead.
+        let p = blob.contents() as *mut u64;
+        if p.is_null() {
+            return Err(candle_core::Error::Msg("PoM Metal bench: blob buffer has null contents".into()));
+        }
         unsafe {
-            let p = blob.contents() as *mut u64;
             let words = blob_len / 8;
             for i in 0..words {
                 *p.add(i) = (i as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
@@ -320,7 +325,24 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
 /// mining throughput). Returns a human-readable multi-line result the app can show directly.
 /// One warmup launch is discarded before timing.
 pub fn bench(blob_mb: u64, nonces: u64, iters: u32) -> String {
+    // Panic-safe: this is called across an `extern "C"` FFI boundary (keryx_miner_bench_metal), and
+    // a panic unwinding across that boundary is undefined behaviour (an abort/crash). Any panic from
+    // objc2 / Metal message-sends inside is caught here and turned into an error string instead.
+    std::panic::catch_unwind(|| bench_inner(blob_mb, nonces, iters))
+        .unwrap_or_else(|_| "benchmark crashed (caught) — try a smaller blob".to_string())
+}
+
+fn bench_inner(blob_mb: u64, nonces: u64, iters: u32) -> String {
+    // Clamp the blob to a safe fraction of the device's memory budget so a phone/tablet can't be
+    // pushed into a jetsam SIGKILL by an over-large single allocation (iOS enforces a hard per-app
+    // memory limit far below total RAM). Cap at 40% of the reported budget, and never below 32 MiB
+    // (still far larger than any GPU cache, so the walk stays cache-defeating). This is the fix for
+    // the "benchmark kills the app" report: 256 MiB was too aggressive for smaller iOS devices.
+    let budget_mb = query_all_gpus_vram().first().map(|(_, mb)| *mb).unwrap_or(1024);
+    let safe_mb = (budget_mb * 4 / 10).max(32);
+    let blob_mb = blob_mb.min(safe_mb);
     let blob_bytes = blob_mb * 1024 * 1024;
+
     let miner = match PomGpuMiner::synthetic(0, blob_bytes) {
         Ok(m) => m,
         Err(e) => return format!("bench failed to init: {e}"),
@@ -340,16 +362,14 @@ pub fn bench(blob_mb: u64, nonces: u64, iters: u32) -> String {
     }
     let secs = t0.elapsed().as_secs_f64();
     let total = nonces * iters as u64;
-    let mhs = total as f64 / secs / 1e6;
-    let dev = query_all_gpus_vram();
-    let vram = dev.first().map(|(_, mb)| *mb).unwrap_or(0);
+    let mhs = if secs > 0.0 { total as f64 / secs / 1e6 } else { 0.0 };
     format!(
         "PoM Metal benchmark\n\
          {:.2} MH/s\n\
          blob {} MiB ({} chunks)\n\
          {} nonces x {} iters in {:.2}s\n\
          device budget {} MB",
-        mhs, blob_mb, miner.n_chunks(), nonces, iters, secs, vram
+        mhs, blob_mb, miner.n_chunks(), nonces, iters, secs, budget_mb
     )
 }
 

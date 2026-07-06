@@ -968,9 +968,11 @@ pub extern "C" fn keryx_miner_status() -> *mut std::ffi::c_char {
 /// hardware can be compared without setting up mining.
 #[no_mangle]
 pub extern "C" fn keryx_miner_bench_metal(blob_mb: u64) -> *mut std::ffi::c_char {
-    let blob_mb = if blob_mb == 0 { 256 } else { blob_mb };
-    // 1<<20 nonces/launch keeps each Metal dispatch short (well under any watchdog); 6 launches
-    // averages out scheduling jitter.
+    // 0 = default 128 MiB (conservative for iOS; `pom_gpu::bench` clamps further to a safe fraction
+    // of the device's memory budget). `bench` is panic-safe (catch_unwind) so this FFI call can
+    // never unwind across the boundary. 1<<20 nonces/launch keeps each Metal dispatch short (well
+    // under any watchdog); 6 launches average out scheduling jitter.
+    let blob_mb = if blob_mb == 0 { 128 } else { blob_mb };
     let result = pom_gpu::bench(blob_mb, 1 << 20, 6);
     CString::new(result).unwrap_or_default().into_raw()
 }
