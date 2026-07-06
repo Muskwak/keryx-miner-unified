@@ -296,16 +296,16 @@ impl PomGpuBackend for VulkanDesktopBackend {
     }
 
     fn ensure_installed(&self, device: u32, daa: u64) -> bool {
-        // NOTE: the desktop Vulkan module's free function takes (daa, device) — reversed from the
-        // trait's (device, daa). Adapt here so the trait surface stays uniform across backends.
-        crate::pom_gpu_vulkan_desktop::ensure_installed(daa, device)
+        // The desktop Vulkan module's free function now takes CUDA-order `(device, daa)` so it can
+        // be aliased as `pom_gpu` on vulkan-only builds — same arg order as the trait surface.
+        crate::pom_gpu_vulkan_desktop::ensure_installed(device, daa)
     }
 
-    fn uninstall(&self, _device: u32) {
-        // The desktop Vulkan module's `uninstall()` takes no device arg — it always drops the
-        // INFERENCE device's miner (inference has priority on that one device). The trait passes a
-        // device for uniformity; on this backend the arg is intentionally ignored.
-        crate::pom_gpu_vulkan_desktop::uninstall();
+    fn uninstall(&self, device: u32) {
+        // The desktop Vulkan backend's `uninstall(device)` always drops the INFERENCE device's
+        // miner (inference has priority on that one device) — the `device` arg is accepted for
+        // surface uniformity with CUDA and intentionally ignored by the impl.
+        crate::pom_gpu_vulkan_desktop::uninstall(device);
     }
 
     fn mine(

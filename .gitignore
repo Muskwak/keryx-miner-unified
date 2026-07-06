@@ -1,6 +1,7 @@
 /target
 /target-cuda
 /target-win
+/target-win-vk
 target-hive/
 models/
 escrow.key

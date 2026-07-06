@@ -180,6 +180,35 @@ impl MinerManager {
                 ));
             }
         }
+        // Vulkan-only desktop build (AMD/Intel rig, no CUDA plugin loaded). Same situation as
+        // macOS above: `has_specs()` is false (the keryxcuda plugin only loads on an NVIDIA box),
+        // so `launch_gpu_miner` never spawns and nothing drives `pom_gpu::mine`. Spawn one PoM
+        // worker per enumerated Vulkan device so an AMD/Intel-only rig actually mines. Skipped on a
+        // `--features cuda,vulkan` heterogeneous build (the CUDA plugin's workers drive the NVIDIA
+        // cards; the Phase-3 additive-dispatch generalization is what would also drive Vulkan
+        // devices there). When the `cuda` feature IS on this block is cfg'd out entirely.
+        #[cfg(all(
+            feature = "vulkan",
+            not(feature = "cuda"),
+            not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+        ))]
+        {
+            let n_devices = keryx_miner::pom_gpu::query_all_gpus_vram().len();
+            for device_id in 0..n_devices as u32 {
+                let worker_hashes_tried = Arc::new(AtomicU64::new(0));
+                hashes_by_worker
+                    .lock()
+                    .unwrap()
+                    .insert(format!("#{} (Vulkan)", device_id), Arc::clone(&worker_hashes_tried));
+                handles.push(Self::launch_vulkan_pom_miner(
+                    send_channel.clone(),
+                    recv.clone(),
+                    Arc::clone(&hashes_tried),
+                    worker_hashes_tried,
+                    device_id,
+                ));
+            }
+        }
         let logger_stop = Arc::new(AtomicBool::new(false));
         let logger_stop_spawn = Arc::clone(&logger_stop);
         // Clone the counters the logger reads BEFORE the move-closure, so the originals stay
@@ -542,6 +571,102 @@ impl MinerManager {
             })
         })
     }
+
+    /// Desktop Vulkan PoM worker (AMD RDNA3 / Intel Arc). Mirrors `launch_metal_pom_miner` but is
+    /// parameterized by `device_id` so a multi-GPU AMD/Intel rig spawns one worker per Vulkan
+    /// device. Used on the vulkan-only desktop build (`--features vulkan`, no `cuda`): there is no
+    /// keryxcuda plugin to load on an AMD/Intel box, so `has_specs()` is false and `launch_gpu_miner`
+    /// never spawns — this dedicated thread drives the Vulkan PoM walk on `device_id` instead.
+    /// `pom_gpu` is aliased to `pom_gpu_vulkan_desktop` on this build, so `pom_gpu::mine` etc. route
+    /// to the streamed-blob / zero-dup Vulkan backend directly. Pre-PoM templates carry no GPU work
+    /// here (the desktop Vulkan backend implements PoM only, not kHeavyHash), so they are dropped
+    /// and left to the CPU workers — same as the macOS path.
+    #[cfg(all(
+        feature = "vulkan",
+        not(feature = "cuda"),
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[allow(unreachable_code)]
+    fn launch_vulkan_pom_miner(
+        send_channel: Sender<BlockSeed>,
+        mut block_channel: watch::Receiver<Option<WorkerCommand>>,
+        hashes_tried: Arc<AtomicU64>,
+        worker_hashes_tried: Arc<AtomicU64>,
+        device_id: u32,
+    ) -> MinerHandler {
+        const POM_BATCH: u64 = 1 << 20;
+        std::thread::spawn(move || {
+            (|| {
+                let mut state: Option<Box<pow::State>> = None;
+                let mut pom_nonce: u64 = thread_rng().next_u64();
+                loop {
+                    if state.is_none() {
+                        state = match block_channel.wait_for_change() {
+                            Ok(Some(WorkerCommand::Job(s))) => Some(s),
+                            Ok(Some(WorkerCommand::Close)) => return Ok(()),
+                            Ok(None) => None,
+                            Err(e) => {
+                                info!("Vulkan PoM thread[{}] closing: {}", device_id, e.to_string());
+                                return Ok(());
+                            }
+                        };
+                    }
+                    // Desktop Vulkan mines PoM only. A pre-PoM template has no GPU path here, so
+                    // drop it and wait for the next one — the CPU workers cover pre-PoM kHeavyHash.
+                    if !matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
+                        state = None;
+                        continue;
+                    }
+                    let (pph, time, target_le, daa) = {
+                        let s = state.as_ref().unwrap();
+                        let mut pph = [0u8; 32];
+                        pph.copy_from_slice(&s.pow_hash_header[0..32]);
+                        keryx_miner::pom::salt_pph_bytes_for_daa(&mut pph, s.daa_score);
+                        let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
+                        (pph, time, s.target.to_le_bytes(), s.daa_score)
+                    };
+                    // An OPoI inference may have evicted the mining model (inference has priority).
+                    // Rebuild the walk — and, on the first PoM block, build the shared host index.
+                    if !keryx_miner::pom_gpu::is_installed(device_id) {
+                        keryx_miner::pom_gpu::ensure_installed(device_id, daa);
+                    }
+                    let found =
+                        keryx_miner::pom_gpu::mine(device_id, &pph, time, &target_le, pom_nonce, POM_BATCH);
+                    pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
+                    hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                    worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                    if let Some(nonce) = found {
+                        let built = state.as_ref().and_then(|s| {
+                            let tier = keryx_miner::pom_gpu::current_tier(device_id, s.daa_score)?;
+                            let idx = keryx_miner::pom::active_index_for_tier(tier)?;
+                            s.generate_block_if_pom(nonce, idx.as_ref(), tier)
+                        });
+                        if let Some(block_seed) = built {
+                            match send_channel.blocking_send(block_seed.clone()) {
+                                Ok(()) => block_seed.report_block(),
+                                Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                            }
+                            if let BlockSeed::FullBlock(_) = block_seed {
+                                state = None;
+                            }
+                        }
+                    } else if let Some(cmd) = block_channel.get_changed()? {
+                        state = match cmd {
+                            Some(WorkerCommand::Job(ns)) => Some(ns),
+                            Some(WorkerCommand::Close) => return Ok(()),
+                            None => state,
+                        };
+                    }
+                }
+                Ok(())
+            })()
+            .map_err(|e: Error| {
+                error!("Vulkan PoM thread[{}] crashed: {}", device_id, e.to_string());
+                e
+            })
+        })
+    }
+
 
     #[allow(unreachable_code)]
     fn launch_cpu_miner(

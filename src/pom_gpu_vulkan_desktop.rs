@@ -95,13 +95,34 @@ pub fn resident_blob_bytes() -> u64 {
 /// can use that GPU. Mining rebuilds the blob when it next runs there. Blobs on other mining
 /// devices stay resident — they do not contend with the served model. The host `WeightIndex`
 /// stays (cheap, disk-backed).
-pub fn uninstall() {
+///
+/// The `device` arg is accepted for free-function-surface uniformity with the CUDA backend
+/// (`crate::pom_gpu::uninstall(device)`) so call sites compile identically when this module is
+/// aliased as `pom_gpu` (the vulkan-only build). It is intentionally ignored: the Vulkan backend
+/// always drops the INFERENCE device's miner (inference has priority on that one device), matching
+/// the documented behaviour in the trait wrapper.
+pub fn uninstall(_device: u32) {
     let infer = keryx_vulkan::inference_device_index() as u32;
     if let Ok(mut g) = MINERS.lock() {
         if let Some(m) = g.as_mut() {
             m.remove(&infer);
         }
     }
+}
+
+// ─── CUDA-compatible free-function surface ──────────────────────────────────
+//
+// When the `cuda` Cargo feature is OFF, `lib.rs` aliases `pom_gpu` to THIS module so a vulkan-only
+// desktop binary links zero CUDA DLLs and runs on AMD/Intel-only rigs. The CUDA module's surface
+// (`query_all_gpus_vram`, `ensure_installed(device, daa)`, `uninstall(device)`) must therefore be
+// this module's public surface too, so `miner.rs` / `slm.rs` / `main.rs` / `pom_gpu_backends.rs`
+// compile and call identically on both backends — the CUDA-vs-Vulkan choice happens at the Cargo
+// feature level, not at every call site.
+
+/// Every Vulkan device's VRAM in `(index, mb)` pairs — the CUDA-surface VRAM probe. Empty when no
+/// Vulkan device is present (the unified probe then contributes zero devices for this backend).
+pub fn query_all_gpus_vram() -> Vec<(usize, u64)> {
+    keryx_vulkan::enumerate_devices().into_iter().map(|d| (d.index, d.vram_mb)).collect()
 }
 
 /// Search nonces `[start, start + batch)` on `device`. None if not installed or no winner.
@@ -220,7 +241,7 @@ fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> boo
 /// DAA at startup the miner declares the wrong tier for the rest of the process's life
 /// (BadWeightPath / "block invalid" on every submission, exactly like the pre-H2/post-H2
 /// tier-index regression on the CUDA fork).
-pub fn ensure_installed(daa: u64, device: u32) -> bool {
+pub fn ensure_installed(device: u32, daa: u64) -> bool {
     if is_installed(device) {
         return true;
     }
